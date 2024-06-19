@@ -390,7 +390,7 @@ def run_emcee_basic(n_walkers, n_steps, true_resp, bprf, pool=None, walkers=None
         **kwargs_sampler,
         # moves=moves,        
         )
-    sampler.run_mcmc(walkers, n_steps, **kwargs_run)
+    sampler.run_mcmc(walkers, n_steps, progress=True, **kwargs_run)
     return sampler
 
 # *** PRIORS ***

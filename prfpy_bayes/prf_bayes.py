@@ -261,11 +261,10 @@ class BayesPRF(TSPlotter):
             return prior
 
     def fit_voxel(self, ivx, n_walkers, n_steps, **kwargs):
-        pool            = kwargs.get('pool', None)
+        pool            = kwargs.pop('pool', None)
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
         walkers = self.initialise_walkers(ivx=ivx, n_walkers=n_walkers, **kwargs)
-
         sampler = emcee.EnsembleSampler(
             len(walkers), 
             self.n_params2fit, 
@@ -297,7 +296,7 @@ class BayesPRF(TSPlotter):
             prf_params=full_params,
             model=self.model,
             prfpy_model=self.prfpy_model,
-            real_ts=np.repeat(self.real_ts[ivx,:], full_params.shape[0], axis=0),
+            real_ts=np.repeat(self.real_ts[ivx,:][np.newaxis,...], full_params.shape[0], axis=0),
         )
         self.sampler[ivx].pd_params['walker_id'] = walker_id
         self.sampler[ivx].pd_params['step_id'] = step_id
