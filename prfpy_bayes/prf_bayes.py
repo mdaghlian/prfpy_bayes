@@ -22,11 +22,19 @@ class BayesPRF(TSPlotter):
     designed by Marcus Daghlian
     '''
 
-    def __init__(self, prf_params, model, prfpy_model, real_ts,  **kwargs):
-        super().__init__(prf_params, model=model, prfpy_model=prfpy_model, real_ts=real_ts, **kwargs)
+    def __init__(self, prf_params, model, prfpy_model, real_ts,  **kwargs):        
         ''' __init__
         Set up the object; with important info
         '''
+        
+        # If no prf_params are passed, make an empty array 
+        model_labels = prfpy_params_dict()[model] # Get names for different model parameters...
+        n_params = len(model_labels)
+        if prf_params is None: 
+            prf_params = np.zeros((real_ts.shape[0], n_params))
+        
+        # Call the parent class
+        super().__init__(prf_params, model=model, prfpy_model=prfpy_model, real_ts=real_ts, **kwargs)
         # Setup and save model information:
         self.n_params = len(self.model_labels)
         if self.incl_rsq:
@@ -39,16 +47,12 @@ class BayesPRF(TSPlotter):
         self.model_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"
         self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
         self.bounds = {}
-        self.init_walker_method = kwargs.get('init_walker_method', 'random_prior')  # How to setup the walkers? "random_prior", "gauss_ball" (see emcee docs) and 
-                                                                                    # "initialise_walkers" below for more details       
-
-        self.init_walker_ps = kwargs.get('init_walker_ps', np.zeros(self.n_params)) # if using "gauss_ball" to initialize the walkers, this is the jitter point        
+        self.init_walker_method = kwargs.get('init_walker_method', 'gauss_ball')   # How to setup the walkers? "random_prior", "gauss_ball" (see emcee docs)
+        self.amp_method = kwargs.get('amp_method', 'glm')        # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
         self.gauss_ball_jitter = kwargs.get('gauss_ball_jitter', 1e-4)              # How much to jitter each parameter by
-        self.save_like = kwargs.get('save_like', True)      # save likelihood for each MCMC step as well as the log_prob (see blobs in emcee)        
-        self.walker_start = [None] * self.n_vox             # Where to start the walkers...
         self.sampler = [None] * self.n_vox                  # The sampler object for each voxel
 
-    def add_prior(self, pid, **kwargs):
+    def add_prior(self, pid, prior_type, **kwargs):
         ''' 
         Adds the prior to each parameter:
         Used for 
@@ -61,11 +65,11 @@ class BayesPRF(TSPlotter):
             uniform:    uniform probability b/w the specified bounds (vmin, vmax). Otherwise infinite
             normal:     normal probability. (loc, scale)
             none:       The parameter can still vary, but it will not influence the outcome... 
+
         '''        
         if pid not in self.model_labels.keys(): # Is this a valid parameter to add? 
             print('error...')
             return
-        prior_type = kwargs.get('prior_type')   # Which prior? uniform, fixed, normal
         self.model_prior_type[pid] = prior_type 
         if prior_type=='normal':
             # Get loc, and scale
@@ -92,23 +96,24 @@ class BayesPRF(TSPlotter):
     def add_priors_from_bounds(self, bounds):
         '''
         Used to setup uninformative priors: i.e., uniform between the bouds
-        Can setup more informative, like a normal using the other methods
-        '''
+        Can setup more informative, like a normal using the other methods        
+        '''        
         for i_p, v_p in enumerate(self.model_labels.keys()):
             if v_p=='rsq':
                 continue
-            if bounds[i_p][0]!=bounds[i_p][1]: 
+
+            if bounds[v_p][0]!=bounds[v_p][1]: 
                 self.add_prior(
                     pid=v_p,
                     prior_type = 'uniform',
-                    vmin = bounds[i_p][0],
-                    vmax = bounds[i_p][1],
+                    vmin = bounds[v_p][0],
+                    vmax = bounds[v_p][1],
                     )
             else: # If upper & lower bound are the same, make it a fixed parameter
                 self.add_prior(
                     pid=v_p,
                     prior_type = 'fixed',
-                    fixed_val = bounds[i_p][0],
+                    fixed_val = bounds[v_p][0],
                     )
                 
 
@@ -128,20 +133,29 @@ class BayesPRF(TSPlotter):
             self.init_p_id[p] = i_p        
         
 
-    def initialise_walkers(self, ivx, n_walkers, **kwargs):
+    def initialise_walkers(self, idx, n_walkers, **kwargs):
         ''' initialise_walkers for a given voxel
-        For a certain number of walkers setup a
         '''
-        if self.init_walker_method == "random_prior":
+        init_walker_method = kwargs.get('init_walker_method', self.init_walker_method)
+        initial_guess = kwargs.get('initial_guess', None) # What is our starting point
+        if initial_guess is not None:
+            kwargs['params_in'] = initial_guess # Set the initial guess
+        ow_walkers = kwargs.get('walkers', None)
+        if ow_walkers is not None:
+            return ow_walkers
+        if init_walker_method == "random_prior":
             # Create walkers from random prior
             walker_start = self.init_walker_random_prior(n_walkers=n_walkers)
-        elif self.init_walker_method == "gauss_ball":
-            walker_start = self.init_walker_gauss_ball(n_walkers=n_walkers, ivx=ivx, **kwargs)
-        elif self.init_walker_method == "fixed":
-            walker_start = self.init_walker_fixed(n_walkers=n_walkers, ivx=ivx)
+        elif init_walker_method == "gauss_ball":
+            walker_start = self.init_walker_gauss_ball(n_walkers=n_walkers, idx=idx, **kwargs)
+        elif init_walker_method == "fixed":
+            walker_start = self.init_walker_fixed(n_walkers=n_walkers, idx=idx, **kwargs)
         return walker_start
 
     def init_walker_random_prior(self, n_walkers):
+        '''Create n_walkers 
+        Randomly sample from the prior for each parameter
+        '''
         # Only initialise params to fit...
         walker_start = []
         for iw in range(n_walkers):
@@ -151,35 +165,37 @@ class BayesPRF(TSPlotter):
             walker_start.append(np.array(params))
         return walker_start
     
-    def init_walker_gauss_ball(self, n_walkers, ivx, params_in=None, eps=None):
+    def init_walker_gauss_ball(self, n_walkers, idx, **kwargs):
         '''
         Start the walkers as a little gaussian ball around a specified point in parameter space. Essentially adding jitter.
         - i.e., the grid fit
         Or use default: self.init_p
         Automatically resizes them to be the fit parameters...
         '''
+        params_in = kwargs.get('params_in', None)
+        eps = kwargs.get('eps', self.gauss_ball_jitter)        
         if params_in is not None:
             # Specified params_in
-            if params_in.shape[0]==self.n_params:
+            if len(params_in)==self.n_params:
                 p2fit_in = self.params_full2fit(params_in)
-            elif params_in.shape[0]==self.n_params2fit:
+            elif len(params_in)==self.n_params2fit:
                 p2fit_in = params_in
         else:
-            params_in = self.prf_params_np[ivx, :-1]
+            # Take it from the initial best guess....
+            params_in = self.prf_params_np[idx, :-1]
             p2fit_in = self.params_full2fit(params_in)
-        if eps is None:
-            print('blooooooop')
-            eps = self.gauss_ball_jitter
+
         walker_start = p2fit_in + eps * np.random.randn(n_walkers, self.n_params2fit)
         return walker_start          
     
-    def init_walker_fixed(self, n_walkers, ivx, params_in=None):
+    def init_walker_fixed(self, n_walkers, idx, **kwargs):
         '''
         Start the walkers all on an identical specified point in parameter space 
         can use the starting params for this voxel
         Or can specify here (params_in)        
         Automatically resizes them to be the fit parameters...
         '''
+        params_in = kwargs.get('params_in', None)
         if params_in is not None:
             # Specified params_in
             if params_in.shape[0]==self.n_params:
@@ -187,9 +203,9 @@ class BayesPRF(TSPlotter):
             elif params_in.shape[0]==self.n_params2fit:
                 p2fit_in = params_in
         else:
-            params_in = self.prf_params_np[ivx, :-1]
+            params_in = self.prf_params_np[idx, :-1]
             p2fit_in = self.params_full2fit(params_in)
-        walker_start = p2fit_in + np.zeros(n_walkers, self.n_params2fit)
+        walker_start = p2fit_in + np.zeros((n_walkers, self.n_params2fit))
         return walker_start
         
 
@@ -237,9 +253,21 @@ class BayesPRF(TSPlotter):
         pred = np.nan_to_num(np.squeeze(self.prfpy_model.return_prediction(*list(np.array(new_params)))))
         return pred        
 
+    # Log-likelihood function for the model
     def ln_likelihood(self, params, response):
         model_response = self.prfpy_model_wrapper(params)
-        return -0.5 * np.sum((response - model_response)**2)
+        # ***** CHANGE THIS TO BE A LIKELIHOOD FUNCTION *****
+        # THIS IS DODGY !!!!
+        # Log-likelihood, if we assume residuals are normally distributed
+        # with mean 0 and variance 1, then the log-likelihood is
+        # log_like = -0.5 * np.sum((response - model_response)**2) 
+        
+        
+        # Follow https://github.com/Joana-Carvalho/Micro-Probing/blob/master/computing_mcmc_tiny_ica.m
+        residuals = response - model_response
+        muhat, sigmahat = stats.norm.fit(residuals)
+        log_like = np.log(stats.norm.pdf(residuals, muhat, sigmahat)).sum()
+        return log_like
 
     # Log-prior function for the model
     def ln_prior(self, params):
@@ -249,38 +277,34 @@ class BayesPRF(TSPlotter):
             p_out += self.model_prior[v_p](params[i_p])
         return p_out    
 
-    # Log-posterior function for the model
-    # -> technically this is the joint distribution as we are not normalizing
-    # by the marginal_likelihood... But this doesn't really apply here...     
     def ln_posterior(self, params, response):
         prior = self.ln_prior(params)
         like = self.ln_likelihood(params, response)
-        if self.save_like:        
-            return prior + like, like # save both...
-        else:
-            return prior
+        return prior + like, like # save both...
 
-    def fit_voxel(self, ivx, n_walkers, n_steps, **kwargs):
+    def run_mcmc_fit(self, idx, n_walkers, n_steps, **kwargs):
         pool            = kwargs.pop('pool', None)
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
-        walkers = self.initialise_walkers(ivx=ivx, n_walkers=n_walkers, **kwargs)
+        walkers = self.initialise_walkers(idx=idx, n_walkers=n_walkers, **kwargs)
+        # Run a test
+        self.ln_prior(walkers[0])
+        self.ln_likelihood(walkers[0], self.real_ts[idx,:])
+        self.ln_posterior(walkers[0], self.real_ts[idx,:])
+
         sampler = emcee.EnsembleSampler(
-            len(walkers), 
-            self.n_params2fit, 
-            self.ln_posterior, 
-            args=(self.real_ts[ivx,:],),
+            nwalkers=len(walkers), 
+            ndim=self.n_params2fit, 
+            log_prob_fn=self.ln_posterior, 
+            args=(self.real_ts[idx,:],),
             pool=pool,
             **kwargs_sampler,
             )
         sampler.run_mcmc(walkers, n_steps, **kwargs_run)
         # Return the chain, log_prob, 
         chain = sampler.get_chain(discard=0, flat=False)
-        flat_params = chain.reshape(-1, self.n_params2fit)
-        
+        flat_params = chain.reshape(-1, self.n_params2fit)        
         logprob = sampler.get_log_prob(discard=0, flat=False)
-        rsq = logprob2rsq(logprob, self.real_ts[ivx,:])   
-        flat_rsq = rsq.reshape(-1, 1)     
 
         walker_id, step_id = np.meshgrid(np.arange(n_walkers), np.arange(n_steps))
         walker_id = walker_id.flatten()
@@ -290,16 +314,29 @@ class BayesPRF(TSPlotter):
         full_params = np.zeros((flat_params.shape[0], self.n_params))
         for i_p, p in enumerate(flat_params):
             full_params[i_p] = self.params_fit2full(p)
-        full_params[:,-1] = np.squeeze(flat_rsq)
+        
+        # Recalculate rsq
+        # Recalculate rsq 
+        preds = self.prfpy_model.return_prediction(
+            mu_x=full_params[:,0],
+            mu_y=full_params[:,1],
+            size=full_params[:,2],
+            beta=full_params[:,3],
+            baseline=full_params[:,4],
+        )
+        rsq = dag_get_rsq(tc_target=self.real_ts[idx,:], tc_fit=preds)        
+        full_params[:,-1] = np.squeeze(rsq)
+        
         # Now make a PRF object
-        self.sampler[ivx] = TSPlotter(
+        self.sampler[idx] = TSPlotter(
             prf_params=full_params,
             model=self.model,
             prfpy_model=self.prfpy_model,
-            real_ts=np.repeat(self.real_ts[ivx,:][np.newaxis,...], full_params.shape[0], axis=0),
+            real_ts=np.repeat(self.real_ts[idx,:][np.newaxis,...], full_params.shape[0], axis=0),
         )
-        self.sampler[ivx].pd_params['walker_id'] = walker_id
-        self.sampler[ivx].pd_params['step_id'] = step_id
+        self.sampler[idx].pd_params['walker_id'] = walker_id
+        self.sampler[idx].pd_params['step_id'] = step_id
+        self.sampler[idx].pd_params['logprob'] = logprob.flatten()
 
 
 
@@ -307,11 +344,13 @@ class BayesPRF(TSPlotter):
 # *** PRIORS ***
 class PriorNorm():    
     def __init__(self, loc, scale):
-        self.loc = loc
-        self.scale = scale
+        self.loc = loc # mean
+        self.scale = scale # standard deviation
     def sampler(self, n_samples):
+        # Sample from the normal distribution
         return np.random.normal(self.loc, self.scale, n_samples)
     def prior(self, p):
+        # Return the log probability of the parameter given the normal distribution
         return stats.norm.logpdf(p, self.loc, self.scale)
 
 class PriorUniform():
@@ -320,17 +359,19 @@ class PriorUniform():
         self.vmax = vmax
     def sampler(self, n_samples):
         return np.random.uniform(self.vmin, self.vmax, n_samples)
-    def prior(self, p):
-        return 0 if self.vmin <= p <= self.vmax else -np.inf
+    def prior(self, param):
+        return 0 if self.vmin <= param <= self.vmax else -np.inf
 
 class PriorFixed():
     def __init__(self, fixed_val):
         self.fixed_val = fixed_val
-    def prior(self, p):
-        return p*0.0
+    def prior(self, param):
+        # I know it seems silly, but it ensures the datatypes are the same
+        return param*0.0
 
 class PriorNone():
     def __init__(self):
         self.bounds = 'None'        
-    def prior(self,p):
-        return p*0.0
+    def prior(self,param):
+        # I know it seems silly, but it ensures the datatypes are the same
+        return param*0.0 
