@@ -1,4 +1,7 @@
-from prfpy_csenf.model import *
+try:
+    from prfpy.model import *
+except:
+    from prfpy_csenf.model import *
 
 import numpy as np
 from scipy import stats 
@@ -48,7 +51,9 @@ class BayesPRF(TSPlotter):
         self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
         self.bounds = {}
         self.init_walker_method = kwargs.get('init_walker_method', 'gauss_ball')   # How to setup the walkers? "random_prior", "gauss_ball" (see emcee docs)
-        self.amp_method = kwargs.get('amp_method', 'glm')        # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
+        # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
+        # NOT IMPLEMENTED (YET)
+        self.amp_method = kwargs.get('amp_method', 'glm')        
         self.gauss_ball_jitter = kwargs.get('gauss_ball_jitter', 1e-4)              # How much to jitter each parameter by
         self.sampler = [None] * self.n_vox                  # The sampler object for each voxel
 
@@ -255,18 +260,27 @@ class BayesPRF(TSPlotter):
 
     # Log-likelihood function for the model
     def ln_likelihood(self, params, response):
-        model_response = self.prfpy_model_wrapper(params)
-        # ***** CHANGE THIS TO BE A LIKELIHOOD FUNCTION *****
-        # THIS IS DODGY !!!!
-        # Log-likelihood, if we assume residuals are normally distributed
-        # with mean 0 and variance 1, then the log-likelihood is
-        # log_like = -0.5 * np.sum((response - model_response)**2) 
+        ''' THIS IS DODGY - ASK REMCO
+        Vaguely following:
+        https://github.com/Joana-Carvalho/Micro-Probing/blob/master/computing_mcmc_tiny_ica.m
+        '''
+        # [1] Get the predicted time series
+        model_response = self.prfpy_model_wrapper(params)        
         
-        
-        # Follow https://github.com/Joana-Carvalho/Micro-Probing/blob/master/computing_mcmc_tiny_ica.m
+        # [2] Calculate the residuals
         residuals = response - model_response
+
+        # [3] Fit a normal distribution to the residuals
         muhat, sigmahat = stats.norm.fit(residuals)
-        log_like = np.log(stats.norm.pdf(residuals, muhat, sigmahat)).sum()
+
+        # [4] Check if the spread is valid
+        if sigmahat <= 0:
+            return -np.inf
+
+        # [5] Calculate the log likelihood of the residuals
+        # given the fitted normal distribution (feels a bit circular?)
+        # then add it up for all time points
+        log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
         return log_like
 
     # Log-prior function for the model
@@ -311,18 +325,13 @@ class BayesPRF(TSPlotter):
         step_id = step_id.flatten()
 
         # make them full params
-        full_params = np.zeros((flat_params.shape[0], self.n_params))
+        full_params = np.zeros((flat_params.shape[0], self.n_params+1))
         for i_p, p in enumerate(flat_params):
-            full_params[i_p] = self.params_fit2full(p)
+            full_params[i_p,:-1] = self.params_fit2full(p)
         
-        # Recalculate rsq
         # Recalculate rsq 
         preds = self.prfpy_model.return_prediction(
-            mu_x=full_params[:,0],
-            mu_y=full_params[:,1],
-            size=full_params[:,2],
-            beta=full_params[:,3],
-            baseline=full_params[:,4],
+            *list(np.array(full_params[:,:-1].T))
         )
         rsq = dag_get_rsq(tc_target=self.real_ts[idx,:], tc_fit=preds)        
         full_params[:,-1] = np.squeeze(rsq)

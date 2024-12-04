@@ -2,24 +2,38 @@ import numpy as np
 from scipy import stats 
 import emcee
 
-from prfpy_csenf.model import *
+try: 
+    from prfpy.model import *
+except:
+    from prfpy_csenf.model import *
 from .utils import *
 from dag_prf_utils.prfpy_ts_plotter import TSPlotter
 from dag_prf_utils.utils import dag_get_rsq
 import emcee
 
-class MicroProb():
-    '''Class to do some mico-probing of the data
+class MicroProbe():
+    '''Class to do some mico-probing of the data    
     '''
-
     def __init__(self, prfpy_model, real_ts, **kwargs):
+        '''Initialise the class
+        prfpy_model: prfpy model object
+        real_ts: the real time series
+        kwargs: other arguments
+        '''
         self.model='gauss'
         self.prfpy_model = prfpy_model
         self.real_ts = real_ts
         # DEFAULTS 
         self.bounds = kwargs.get('bounds', [-5, 5])
+        # -> HRF parameters (coefficient for the derivative of the HRF and dispersion)
+        self.hrf_deriv = kwargs.get('hrf_deriv', 4.6) 
+        self.hrf_disp = kwargs.get('hrf_disp', 0)
+        # -> size of microprobe
         self.tiny_prf_size = kwargs.get('tiny_prf_size', 0.01) # 0.01 degrees
         self.fixed_baseline = kwargs.get('fixed_baseline', False) # Fix the baseline during fitting?
+        self.init_walker_method = kwargs.get('init_walker_method', 'grid')          
+        self.gauss_ball_jitter = kwargs.get('gauss_ball_jitter', 1)              # How much to jitter each parameter by
+        # -> where we will save the fits to the data
         self.sampler = [None] * len(real_ts)
 
     def ln_prior(self, params):
@@ -38,8 +52,7 @@ class MicroProb():
         
     def ln_likelihood(self, params, response):
         '''Log likelihood
-        Given the parameters, predict the time series 
-        Compare the predicted time series to the actual time series
+        DODGY - ASK REMCO
         '''
         # Get the predicted time series
         pred = self.prfpy_model.return_prediction(
@@ -50,6 +63,7 @@ class MicroProb():
             baseline=np.array([0]),
         )
         # Estimate slope and offset using calssical GLM and OLS
+        # THIS IS DIFFERENT FROM prf_bayes (where we fit the slope and offset inside MCMC)
         m_response = np.mean(response)
         m_pred = np.mean(pred)
         slope = np.sum((response - m_response) * (pred - m_pred)) / np.sum((pred - m_pred) **2)
@@ -61,15 +75,21 @@ class MicroProb():
         # Estimate mean and std of the residuals (assuming normal distribution)
         # -> check for nonfinite values 
         try:        
-            mres, sres = stats.norm.fit(residuals.squeeze())
+            muhat, sigmahat = stats.norm.fit(residuals.squeeze())
         except:
-            mres, sres = 0, 1e-6 # If there are non-finite values, return a small value
-        # Calculate the log likelihood
-        like = np.sum(stats.norm.logpdf(residuals, loc=mres, scale=sres))
-        # Nan check
-        if np.isnan(like):
-            like = -np.inf
-        return like
+            # In case of invalid output
+            return -np.inf # If there are non-finite values, return a small value
+        
+        # Check if the spread is valid
+        if sigmahat <= 0:
+            return -np.inf
+        
+        # Calculate the log likelihood of the residuals
+        # given the fitted normal distribution (feels a bit circular?)
+        # then add it up for all time points
+        log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+
+        return log_like
     
     def ln_posterior(self, params, response):
         '''Log posterior
@@ -80,14 +100,28 @@ class MicroProb():
         like = self.ln_likelihood(params, response)
         return prior + like, like # Save both the prior and likelihood
 
-    def initialise_walkers(self, n_walkers, initial_guess, **kwargs):
-        '''How can we initialise the walkers?
-        Give it a good "best guess" starting point
-        Then add some noise to it, around a gaussian ball (recommended for the stretch move)
+    def initialise_walkers(self, n_walkers, **kwargs):
+        ''' initialise_walkers for a given voxel
         '''
-        eps = kwargs.get('eps', 1e-4)      # The amount of noise to add 
-        walker_start = initial_guess + eps * np.random.randn(n_walkers, len(initial_guess))
-        
+        init_walker_method = kwargs.get('init_walker_method', self.init_walker_method)
+        initial_guess = kwargs.get('initial_guess', [0,0]) # What is our starting point
+        eps = kwargs.get('gaus_ball_jitter', self.gauss_ball_jitter)      # The amount of noise to add 
+        ow_walkers = kwargs.get('walkers', None)
+        if ow_walkers is not None:
+            return ow_walkers
+        if init_walker_method == "random":
+            # Create walkers from random prior
+            walker_start = np.random.uniform(
+                low=self.bounds[0], high=self.bounds[1], size=(n_walkers, len(initial_guess))
+            )
+        elif init_walker_method == "gauss_ball":
+            walker_start = initial_guess + eps * np.random.randn(n_walkers, len(initial_guess))
+        elif init_walker_method == "grid":
+            # x grid 
+            x = np.linspace(self.bounds[0], self.bounds[1], int(np.sqrt(n_walkers)))
+            y = np.linspace(self.bounds[0], self.bounds[1], int(np.sqrt(n_walkers)))
+            x, y = np.meshgrid(x, y)
+            walker_start = np.vstack([x.flatten(), y.flatten()]).T
         return walker_start
     
     def run_mcmc_fit(self, idx, n_walkers, n_steps, **kwargs):
@@ -98,9 +132,13 @@ class MicroProb():
         pool            = kwargs.pop('pool', None)
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
-        initial_guess   = kwargs.pop('initial_guess', [0, 0, 1])
+        initial_guess   = kwargs.pop('initial_guess', [0, 0])
         walkers = self.initialise_walkers(
             n_walkers=n_walkers, initial_guess=initial_guess, **kwargs)
+        if n_walkers != len(walkers):
+            print('Used grid - so we got more walkers than requested')
+            print(f'updating n_walkers to {len(walkers)}')
+            n_walkers = len(walkers)
         n_paramss2fit = len(initial_guess)
         # Quick test first - is everything going to work?
         self.ln_prior(walkers[0])
@@ -131,11 +169,13 @@ class MicroProb():
         walker_id = walker_id.flatten()
         step_id = step_id.flatten()
 
-        # make them full params
+        # Here i'm not fitting the slope or baseline (i.e., the GLM bit) inside the MCMC
+        # So we need to do this now
+        slopes, baselines = self._return_amp_and_bl(flat_params, target_timeseries)
+
         # Normally when you run prfpy for gauss fit you get array n * 8 (x, y, size, beta, baseline, hrf1, hrf2, rsq)
         # Lets put it into that format
-        slopes, baselines = self._return_amp_and_bl(flat_params, target_timeseries)
-        full_params = np.zeros((flat_params.shape[0], 8))
+        full_params = np.zeros((flat_params.shape[0], 8)) # +1 for rsq
         full_params[:,0] = flat_params[:,0] # x
         full_params[:,1] = flat_params[:,1] # y
         full_params[:,2] = self.tiny_prf_size # size
