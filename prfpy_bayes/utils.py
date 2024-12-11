@@ -2,6 +2,19 @@ import numpy as np
 import os
 opj = os.path.join
 
+
+class PrfpyModelGlobal():
+    '''So we can access a particular prfpy model from the MPFast class
+    (speedy pickling)
+    '''
+    def __init__(self, model=None):
+        self.prfpy_model = model
+
+    def set_model(self, model):
+        self.prfpy_model = model
+
+
+
 def prfpy_params_dict():
     '''
     Easy look up table for prfpy model parameters

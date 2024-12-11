@@ -11,6 +11,8 @@ from .utils import *
 from dag_prf_utils.prfpy_functions import *
 from dag_prf_utils.prfpy_ts_plotter import *
 
+
+prfpy_global_model = PrfpyModelGlobal()
 class BayesPRF(TSPlotter):
     ''' BayesPRF 
     A wrapper object meant to sit on top of prfpy models (https://github.com/VU-Cog-Sci/prfpy/tree/main/prfpy)
@@ -29,7 +31,7 @@ class BayesPRF(TSPlotter):
         ''' __init__
         Set up the object; with important info
         '''
-        
+        self.kwargs = kwargs
         # If no prf_params are passed, make an empty array 
         model_labels = prfpy_params_dict()[model] # Get names for different model parameters...
         n_params = len(model_labels)
@@ -92,6 +94,7 @@ class BayesPRF(TSPlotter):
 
         elif prior_type=='fixed':
             fixed_val = kwargs.get('fixed_val')
+            self.bounds[pid] = [fixed_val, fixed_val]
             self.fixed_vals[pid] = fixed_val
             self.model_prior[pid] = PriorFixed(fixed_val).prior
 
@@ -300,20 +303,40 @@ class BayesPRF(TSPlotter):
         pool            = kwargs.pop('pool', None)
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
-        walkers = self.initialise_walkers(idx=idx, n_walkers=n_walkers, **kwargs)
+        walkers = self.initialise_walkers(idx=idx, n_walkers=n_walkers, **kwargs)        
         # Run a test
         self.ln_prior(walkers[0])
         self.ln_likelihood(walkers[0], self.real_ts[idx,:])
         self.ln_posterior(walkers[0], self.real_ts[idx,:])
-
-        sampler = emcee.EnsembleSampler(
-            nwalkers=len(walkers), 
-            ndim=self.n_params2fit, 
-            log_prob_fn=self.ln_posterior, 
-            args=(self.real_ts[idx,:],),
-            pool=pool,
-            **kwargs_sampler,
-            )
+        # Ok - now we can run the sampler!!
+        # Running in parallel?
+        if pool is not None:
+            print('Running in parallel')
+            prfpy_global_model.set_model(self.prfpy_model)
+            # Now make the fast one
+            bpfast = BPFast(model=self.model, real_ts=self.real_ts[idx,:].copy(), **self.kwargs)
+            # Add bounds
+            bpfast.add_priors_from_bounds(self.bounds)
+            bpfast.prep_info()
+            # Run a quick test
+            bpfast.ln_posterior(walkers[0])
+            sampler = emcee.EnsembleSampler(
+                nwalkers=len(walkers), 
+                ndim=self.n_params2fit, 
+                log_prob_fn=bpfast.ln_posterior, 
+                pool=pool,
+                **kwargs_sampler, # Any other arguments that you want to pass to the sampler
+                ) 
+        else:
+            print('Running in serial')
+            sampler = emcee.EnsembleSampler(
+                nwalkers=len(walkers), 
+                ndim=self.n_params2fit, 
+                log_prob_fn=self.ln_posterior, 
+                args=(self.real_ts[idx,:],),
+                pool=pool,
+                **kwargs_sampler,
+                )
         sampler.run_mcmc(walkers, n_steps, **kwargs_run)
         # Return the chain, log_prob, 
         chain = sampler.get_chain(discard=0, flat=False)
@@ -348,7 +371,189 @@ class BayesPRF(TSPlotter):
         self.sampler[idx].pd_params['logprob'] = logprob.flatten()
 
 
+class BPFast():
+    ''' BayesPRF 
+    '''
 
+    def __init__(self, model, real_ts,  **kwargs):        
+        ''' __init__
+        Set up the object; with important info
+        '''
+        self.model_labels = prfpy_params_dict()[model]
+        self.real_ts = real_ts.squeeze()
+        # Setup and save model information:
+        self.n_params = len(self.model_labels) - 1
+        self.model_labels_inv = {value: key for key, value in self.model_labels.items()}        
+        # MCMC specific information
+        self.model_sampler = {}                                     # A sampler for each parameter (e.g., randomly pick "x" b/w -5 and 5)
+        self.model_prior = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
+        self.model_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"        
+        self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
+        self.bounds = {}
+
+    def add_prior(self, pid, prior_type, **kwargs):
+        ''' 
+        Adds the prior to each parameter:
+        Used for 
+        [1] evaluating the posterior (e.g., to enforce parameter bounds)
+        [2] Initialising walker positions (if init_walker_method=='random_prior')
+        > randomly sample parameters from the prior distributions
+
+        Options:
+            fixed:      will 'hide' the parameter from MCMC fitting procedure (not really a prior...)
+            uniform:    uniform probability b/w the specified bounds (vmin, vmax). Otherwise infinite
+            normal:     normal probability. (loc, scale)
+            none:       The parameter can still vary, but it will not influence the outcome... 
+
+        '''        
+        if pid not in self.model_labels.keys(): # Is this a valid parameter to add? 
+            print('error...')
+            return
+        self.model_prior_type[pid] = prior_type 
+        if prior_type=='normal':
+            # Get loc, and scale
+            loc = kwargs.get('loc')    
+            scale = kwargs.get('scale')    
+            self.model_sampler[pid] = PriorNorm(loc, scale).sampler 
+            self.model_prior[pid]   = PriorNorm(loc, scale).prior            
+
+        elif prior_type=='uniform' :
+            vmin = kwargs.get('vmin')
+            vmax = kwargs.get('vmax')
+            self.bounds[pid] = [vmin, vmax]
+            self.model_sampler[pid] = PriorUniform(vmin, vmax).sampler
+            self.model_prior[pid] = PriorUniform(vmin, vmax).prior            
+
+        elif prior_type=='fixed':
+            fixed_val = kwargs.get('fixed_val')
+            self.bounds[pid] = [fixed_val, fixed_val]
+            self.fixed_vals[pid] = fixed_val
+            self.model_prior[pid] = PriorFixed(fixed_val).prior
+
+        elif prior_type=='none':
+            self.model_prior[pid] = PriorNone().prior            
+    
+    def add_priors_from_bounds(self, bounds):
+        '''
+        Used to setup uninformative priors: i.e., uniform between the bouds
+        Can setup more informative, like a normal using the other methods        
+        '''        
+        for i_p, v_p in enumerate(self.model_labels.keys()):
+            if v_p=='rsq':
+                continue
+
+            if bounds[v_p][0]!=bounds[v_p][1]: 
+                self.add_prior(
+                    pid=v_p,
+                    prior_type = 'uniform',
+                    vmin = bounds[v_p][0],
+                    vmax = bounds[v_p][1],
+                    )
+            else: # If upper & lower bound are the same, make it a fixed parameter
+                self.add_prior(
+                    pid=v_p,
+                    prior_type = 'fixed',
+                    fixed_val = bounds[v_p][0],
+                    )
+                
+    def prep_info(self):
+        ''' prep_info
+        Set up object for fitting...
+        i.e., check which parameters are fixed etc.
+        '''
+        self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)
+        self.all_p_list = list(self.model_labels.keys())                # List of *all* parameters names
+        self.fix_p_list = list(self.fixed_vals.keys())                  # List of *fixed* parameter names 
+        self.fit_p_list = list(
+            x for x in self.all_p_list if x not in self.fix_p_list)     # List of *fitted* parameter names 
+        self.fit_p_list = [i for i in self.fit_p_list if i!='rsq']
+        self.init_p_id = {}                                             # Map from fitted parameter name to index (so we don't get lost)
+        for i_p,p in enumerate(self.fit_p_list):
+            self.init_p_id[p] = i_p        
+        
+    def params_full2fit(self, params):
+        '''
+        Takes array of all parameters (length self.n_params) and removes the
+        fixed parameters. 
+        '''
+        print(params)
+        print(params.shape)
+        print(self.n_params)
+        assert len(params)==self.n_params
+        # Make a new array for parameters
+        new_params = np.zeros(self.n_params2fit)
+        # Instert the fitted parameters
+        for p in self.fit_p_list:
+            print(p)
+            fit_p_id = self.init_p_id[p]
+            full_p_id = self.model_labels[p]
+            new_params[fit_p_id] = params[full_p_id]
+        return new_params
+
+    def params_fit2full(self, params):
+        '''
+        Takes array of parameters being fit (length self.n_params2fit)
+        And adds in the fixed parameters, so that the full list of parameters 
+        can be passed to the prfpy_model
+        '''
+        assert len(params)==self.n_params2fit
+        # Make a new array for parameters
+        new_params = np.zeros(self.n_params)
+        # Instert the fitted parameters
+        for p in self.fit_p_list:
+            fit_p_id = self.init_p_id[p]
+            full_p_id = self.model_labels[p]
+            new_params[full_p_id] = params[fit_p_id]
+        # Insert fixed params:
+        for v_p in self.fixed_vals.keys():
+            i_p = self.model_labels[v_p]        
+            new_params[i_p] = self.fixed_vals[v_p]
+        return new_params
+
+    def prfpy_model_wrapper(self, params):
+        new_params = self.params_fit2full(params)
+        pred = prfpy_global_model.prfpy_model.return_prediction(*list(np.array(new_params)))
+        pred = np.nan_to_num(np.squeeze(pred))
+        return pred        
+
+    # Log-likelihood function for the model
+    def ln_likelihood(self, params):
+        ''' THIS IS DODGY - ASK REMCO
+        Vaguely following:
+        https://github.com/Joana-Carvalho/Micro-Probing/blob/master/computing_mcmc_tiny_ica.m
+        '''
+        response = self.real_ts.copy()
+        # [1] Get the predicted time series
+        model_response = self.prfpy_model_wrapper(params)        
+        
+        # [2] Calculate the residuals
+        residuals = response - model_response
+
+        # [3] Fit a normal distribution to the residuals
+        muhat, sigmahat = stats.norm.fit(residuals)
+
+        # [4] Check if the spread is valid
+        if sigmahat <= 0:
+            return -np.inf
+
+        # [5] Calculate the log likelihood of the residuals
+        # given the fitted normal distribution (feels a bit circular?)
+        # then add it up for all time points
+        log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        return log_like
+
+    # Log-prior function for the model
+    def ln_prior(self, params):
+        p_out = 0.0
+        for v_p in self.fit_p_list:
+            i_p = self.init_p_id[v_p]
+            p_out += self.model_prior[v_p](params[i_p])
+        return p_out    
+
+    def ln_posterior(self, params):
+        prior = self.ln_prior(params)
+        like = self.ln_likelihood(params)
+        return prior + like, like # save both...
 
 # *** PRIORS ***
 class PriorNorm():    
@@ -374,6 +579,8 @@ class PriorUniform():
 class PriorFixed():
     def __init__(self, fixed_val):
         self.fixed_val = fixed_val
+        self.vmin = fixed_val
+        self.vmax = fixed_val
     def prior(self, param):
         # I know it seems silly, but it ensures the datatypes are the same
         return param*0.0
