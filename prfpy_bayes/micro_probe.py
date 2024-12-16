@@ -31,11 +31,11 @@ class MicroProbe():
         # DEFAULTS 
         self.bounds = kwargs.get('bounds', [-5, 5])
         # -> HRF parameters (coefficient for the derivative of the HRF and dispersion)
-        self.hrf_deriv = kwargs.get('hrf_deriv', 4.6) 
-        self.hrf_disp = kwargs.get('hrf_disp', 0)
+        self.hrf_deriv = kwargs.get('hrf_deriv', prfpy_model.hrf_params[1]) 
+        self.hrf_disp = kwargs.get('hrf_disp', prfpy_model.hrf_params[2])
         # -> size of microprobe
         self.tiny_prf_size = kwargs.get('tiny_prf_size', 0.01) # 0.01 degrees
-        self.fixed_baseline = kwargs.get('fixed_baseline', False) # Fix the baseline during fitting?
+        self.fixed_baseline = kwargs.get('fixed_baseline', None) # Fix the baseline during fitting?
         self.init_walker_method = kwargs.get('init_walker_method', 'grid')          
         self.gauss_ball_jitter = kwargs.get('gauss_ball_jitter', 1)              # How much to jitter each parameter by
         # -> where we will save the fits to the data
@@ -56,8 +56,7 @@ class MicroProbe():
         return p_out
         
     def ln_likelihood(self, params, response):
-        '''Log likelihood
-        DODGY - ASK REMCO
+        '''Log likelihood        
         '''
         # Get the predicted time series
         pred = self.prfpy_model.return_prediction(
@@ -66,34 +65,40 @@ class MicroProbe():
             size=np.array([self.tiny_prf_size]),
             beta=np.array([1]), # beta is the amplitude of the response
             baseline=np.array([0]),
-        )
+        ).squeeze()
+        if np.all(pred == 0):
+            # For some reason 0
+            return -np.inf
         # Estimate slope and offset using calssical GLM and OLS
-        # THIS IS DIFFERENT FROM prf_bayes (where we fit the slope and offset inside MCMC)
-        m_response = np.mean(response)
-        m_pred = np.mean(pred)
-        slope = np.sum((response - m_response) * (pred - m_pred)) / np.sum((pred - m_pred) **2)
-        offset = m_response - slope * m_pred
+        if self.fixed_baseline is not None:
+            offset = self.fixed_baseline
+            # Vectorized computation of slopes
+            pred_squares = np.sum(pred**2)
+            slope = np.sum(response * pred) / pred_squares            
+        else:
+            m_response = np.mean(response) # slightly faster
+            m_pred = np.mean(pred) 
+            pred_minus_mean = pred - m_pred  # Only do it once
+            # Faster with @, but below is equivalent to...
+            # >> slope = np.sum((response - m_response) * pred_minus_mean) / np.sum(pred_minus_mean **2)
+            slope = (response - m_response) @ pred_minus_mean / (pred_minus_mean @ pred_minus_mean)
+            offset = m_response - slope * m_pred
         pred = pred * slope + offset
 
         # Calculate log likelihood
         residuals = response - pred        
         # Estimate mean and std of the residuals (assuming normal distribution)
-        # -> check for nonfinite values 
-        try:        
-            muhat, sigmahat = stats.norm.fit(residuals.squeeze())
-        except:
-            # In case of invalid output
-            return -np.inf # If there are non-finite values, return a small value
+        # Assume mean of residuals is 0
+        # muhat, sigmahat = stats.norm.fit(residuals)
+        muhat = 0
+        _, sigmahat = stats.norm.fit(residuals, floc=0)    
         
-        # Check if the spread is valid
-        if sigmahat <= 0:
-            return -np.inf
-        
-        # Calculate the log likelihood of the residuals
-        # given the fitted normal distribution (feels a bit circular?)
-        # then add it up for all time points
-        log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
 
+        # Calculate the log likelihood of the residuals
+        # given the fitted normal distribution
+        # then add it up for all time points
+        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
         return log_like
     
     def ln_posterior(self, params, response):
@@ -131,10 +136,14 @@ class MicroProbe():
     
     def run_mcmc_fit(self, idx, n_walkers, n_steps, **kwargs):
         '''Run the mcmc fitting!
-        '''
+        '''        
         target_timeseries = self.real_ts[idx,:].copy() # Make a copy of the time series 
         # Optional arguments... process with defaults 
-        pool            = kwargs.pop('pool', None)
+        save_mode       = kwargs.pop('save_mode', 'minimal') # What to save in 'sampler': can be obj or minimal
+        save_top_kpsc   = kwargs.pop('save_top_kpsc', None) # Keep the top n % (in terms of model fit)
+        save_min_rsq    = kwargs.pop('save_min_rsq', None) # Only save if the rsq is above this
+        burn_in         = kwargs.pop('burn_in', 0) # How many steps to burn in
+        pool            = kwargs.pop('pool', None)        
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
         initial_guess   = kwargs.pop('initial_guess', [0, 0])
@@ -182,13 +191,14 @@ class MicroProbe():
             **kwargs_run # Any other arguments that you want to pass to the run_mcmc
             )
         # Return the chain, log_prob, (see emcee documentation)
-        chain = sampler.get_chain(discard=0, flat=False)
+        chain = sampler.get_chain(discard=burn_in, flat=False)
         # Flatten the chains....
         flat_params = chain.reshape(-1, n_paramss2fit)
-        logprob = sampler.get_log_prob(discard=0, flat=False).reshape(-1, 1)    
+        logprob = sampler.get_log_prob(discard=burn_in, flat=False).reshape(-1, 1).flatten()
 
+        n_out = n_steps - burn_in
         # Get the index of the walkers, and the steps
-        walker_id, step_id = np.meshgrid(np.arange(n_walkers), np.arange(n_steps))
+        walker_id, step_id = np.meshgrid(np.arange(n_walkers), np.arange(n_out)+burn_in)
         walker_id = walker_id.flatten()
         step_id = step_id.flatten()
 
@@ -196,7 +206,7 @@ class MicroProbe():
         # So we need to do this now
         slopes, baselines = self._return_amp_and_bl(flat_params, target_timeseries)
 
-        # Normally when you run prfpy for gauss fit you get array n * 8 (x, y, size, beta, baseline, hrf1, hrf2, rsq)
+        # Normally when you run prfpy for gauss fit you get array (x, y, size, beta, baseline, hrf1, hrf2, rsq)
         # Lets put it into that format
         full_params = np.zeros((flat_params.shape[0], 8)) # +1 for rsq
         full_params[:,0] = flat_params[:,0] # x
@@ -218,22 +228,49 @@ class MicroProbe():
         
         rsq = dag_get_rsq(tc_target=target_timeseries, tc_fit=preds)
         full_params[:,-1] = rsq
+        id_to_keep = np.ones((len(rsq),), dtype=bool)
+        if save_top_kpsc is not None:
+            best_fits = np.argsort(rsq)[::-1][:int(save_top_kpsc/100 * len(rsq))]
+            print(f'Keeping top {save_top_kpsc}% of fits: = {len(best_fits)} fits')
+            id_to_keep = np.zeros((len(rsq),), dtype=bool)
+            id_to_keep[best_fits] = True
+        if save_min_rsq is not None:
+            id_to_keep &= (rsq > save_min_rsq)
+        
+        # Get the best fits
+        full_params = full_params[id_to_keep,:]
+        logprob = logprob[id_to_keep]
+        walker_id = walker_id[id_to_keep]
+        step_id = step_id[id_to_keep]
 
-        # Now make a PRF object
-        # I've created a useful class for plotting...
-        prf_plotter = TSPlotter(
-            prf_params=full_params,
-            model='gauss',
-            prfpy_model=self.prfpy_model,
-            real_ts=np.repeat(target_timeseries[np.newaxis,...], full_params.shape[0], axis=0), # Repeat the target timeseries for each parameter set
-        )
-        # Also useful to know...
-        prf_plotter.pd_params['logprob'] = logprob.flatten()
-        prf_plotter.pd_params['walker_id'] = walker_id
-        prf_plotter.pd_params['step_id'] = step_id
+        if save_mode == 'obj':
+            # Now make a PRF object
+            # I've created a useful class for plotting...
+            prf_plotter = TSPlotter(
+                prf_params=full_params,
+                model='gauss',
+                prfpy_model=self.prfpy_model,
+                real_ts=np.repeat(target_timeseries[np.newaxis,...], full_params.shape[0], axis=0), # Repeat the target timeseries for each parameter set
+            )
+            # Also useful to know...
+            prf_plotter.pd_params['logprob'] = logprob.flatten()
+            prf_plotter.pd_params['walker_id'] = walker_id
+            prf_plotter.pd_params['step_id'] = step_id
 
-        # Save the sampler
-        self.sampler[idx] = prf_plotter
+            # Save the sampler
+            self.sampler[idx] = prf_plotter
+        elif save_mode == 'minimal':
+            # Save only the important stuff... (don't want it to be too big)
+            self.sampler[idx] = {
+                'x': full_params[:,0],
+                'y': full_params[:,1],
+                'amp_1' : full_params[:,3],
+                'bold_baseline' : full_params[:,4],
+                'rsq': full_params[:,-1],
+                'logprob': logprob,
+                'walker_id': walker_id,
+                'step_id': step_id,
+            }
 
 
     # OTHER USEFULT FUNCTION
@@ -245,19 +282,8 @@ class MicroProbe():
             beta=np.array([1]),
             baseline=np.array([0]),
         )
-        slopes = np.zeros((len(params),))
-        baselines = np.zeros((len(params),))
-        for i in range(len(params)):
-            if self.fixed_baseline:
-                slope = np.sum(response * preds[i]) / np.sum(preds[i] **2)
-                baseline = 0
-            else:
-                m_response = np.mean(response)
-                m_pred = np.mean(preds[i])
-                slope = np.sum((response - m_response) * (preds[i] - m_pred)) / np.sum((preds[i] - m_pred) **2)
-                baseline = m_response - slope * m_pred
-            slopes[i] = slope
-            baselines[i] = baseline
+
+        slopes, baselines = quick_glm(preds, response, fixed_baseline=self.fixed_baseline)
         return slopes, baselines
     
 
@@ -275,6 +301,8 @@ class MPFast():
         '''
         self.model='gauss'
         self.real_ts = real_ts.squeeze()
+        self.m_response = np.mean(self.real_ts)
+
         # DEFAULTS 
         self.bounds = kwargs.get('bounds', [-5, 5])
         # -> HRF parameters (coefficient for the derivative of the HRF and dispersion)
@@ -282,7 +310,7 @@ class MPFast():
         self.hrf_disp = kwargs.get('hrf_disp', 0)
         # -> size of microprobe
         self.tiny_prf_size = kwargs.get('tiny_prf_size', 0.01) # 0.01 degrees
-        self.fixed_baseline = kwargs.get('fixed_baseline', False) # Fix the baseline during fitting?
+        self.fixed_baseline = kwargs.get('fixed_baseline', None) # Fix the baseline during fitting?
 
     def ln_prior(self, params):
         '''Log prior
@@ -305,41 +333,50 @@ class MPFast():
         '''
         response = self.real_ts
         # Get the predicted time series
-
         pred = prfpy_global_model.prfpy_model.return_prediction(
             mu_x=np.array([params[0]]),
             mu_y=np.array([params[1]]),
             size=np.array([self.tiny_prf_size]),
             beta=np.array([1]), # beta is the amplitude of the response
             baseline=np.array([0]),
-        )
+        ).squeeze()
+        if np.all(pred == 0):
+            # For some reason 0
+            return -np.inf
         # Estimate slope and offset using calssical GLM and OLS
-        # THIS IS DIFFERENT FROM prf_bayes (where we fit the slope and offset inside MCMC)
-        m_response = np.mean(response)
-        m_pred = np.mean(pred)
-        slope = np.sum((response - m_response) * (pred - m_pred)) / np.sum((pred - m_pred) **2)
-        offset = m_response - slope * m_pred
+        if self.fixed_baseline is not None:
+            offset = self.fixed_baseline
+            # Vectorized computation of slopes
+            pred_squares = np.sum(pred**2)
+            slope = np.sum(response * pred) / pred_squares            
+        else:
+            m_response = self.m_response # slightly faster
+            m_pred = np.mean(pred) 
+            pred_minus_mean = pred - m_pred  # Only do it once
+            # Faster with @, but below is equivalent to...
+            # >> slope = np.sum((response - m_response) * pred_minus_mean) / np.sum(pred_minus_mean **2)
+            slope = (response - m_response) @ pred_minus_mean / (pred_minus_mean @ pred_minus_mean)
+            offset = m_response - slope * m_pred
         pred = pred * slope + offset
 
         # Calculate log likelihood
         residuals = response - pred        
         # Estimate mean and std of the residuals (assuming normal distribution)
-        # -> check for nonfinite values 
-        try:        
-            muhat, sigmahat = stats.norm.fit(residuals.squeeze())
-        except:
-            # In case of invalid output
-            return -np.inf # If there are non-finite values, return a small value
-        
-        # Check if the spread is valid
-        if sigmahat <= 0:
-            return -np.inf
-        
-        # Calculate the log likelihood of the residuals
-        # given the fitted normal distribution (feels a bit circular?)
-        # then add it up for all time points
-        log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        # Assume mean of residuals is 0
+        # muhat, sigmahat = stats.norm.fit(residuals)
+        muhat = 0
+        _, sigmahat = stats.norm.fit(residuals, floc=0) 
+        sigmahat_v2 = np.std(residuals) # Faster to calculate it this way
+        print(f'v1: {sigmahat} v2: {sigmahat_v2}')
 
+        # Even faster? If we know mean is 0, don't want to fit std, but calculate it?
+        # sigmahat = np.std(residuals)           
+
+        # Calculate the log likelihood of the residuals
+        # given the fitted normal distribution
+        # then add it up for all time points
+        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
         return log_like
     
     def ln_posterior(self, params):

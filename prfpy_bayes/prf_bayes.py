@@ -269,21 +269,27 @@ class BayesPRF(TSPlotter):
         '''
         # [1] Get the predicted time series
         model_response = self.prfpy_model_wrapper(params)        
-        
+        if np.all(model_response == 0):
+            # For some reason 0
+            return -np.inf        
         # [2] Calculate the residuals
         residuals = response - model_response
 
         # [3] Fit a normal distribution to the residuals
-        muhat, sigmahat = stats.norm.fit(residuals)
+        # Assume mean of residuals is 0
+        # muhat, sigmahat = stats.norm.fit(residuals)
+        muhat = 0
+        _, sigmahat = stats.norm.fit(residuals, floc=0) 
 
-        # [4] Check if the spread is valid
-        if sigmahat <= 0:
-            return -np.inf
+        # Even faster? If we know mean is 0, don't want to fit std, but calculate it?
+        # sigmahat = np.std(residuals)           
 
-        # [5] Calculate the log likelihood of the residuals
-        # given the fitted normal distribution (feels a bit circular?)
+        # Calculate the log likelihood of the residuals
+        # given the fitted normal distribution
         # then add it up for all time points
-        log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
+
         return log_like
 
     # Log-prior function for the model
@@ -300,7 +306,14 @@ class BayesPRF(TSPlotter):
         return prior + like, like # save both...
 
     def run_mcmc_fit(self, idx, n_walkers, n_steps, **kwargs):
+        ''' run_mcmc_fit
+        Run the MCMC fit for a given voxel
+        '''
         pool            = kwargs.pop('pool', None)
+        save_mode       = kwargs.pop('save_mode', 'minimal') # What to save in 'sampler': can be obj or minimal
+        save_top_kpsc   = kwargs.pop('save_top_kpsc', 15) # Keep the top n % (in terms of model fit)
+        save_min_rsq    = kwargs.pop('save_min_rsq', 0.1) # Only save if the rsq is above this
+        burn_in         = kwargs.pop('burn_in', 0) # How many steps to burn in
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
         walkers = self.initialise_walkers(idx=idx, n_walkers=n_walkers, **kwargs)        
@@ -339,11 +352,12 @@ class BayesPRF(TSPlotter):
                 )
         sampler.run_mcmc(walkers, n_steps, **kwargs_run)
         # Return the chain, log_prob, 
-        chain = sampler.get_chain(discard=0, flat=False)
+        chain = sampler.get_chain(discard=burn_in, flat=False)
         flat_params = chain.reshape(-1, self.n_params2fit)        
-        logprob = sampler.get_log_prob(discard=0, flat=False)
+        logprob = sampler.get_log_prob(discard=burn_in, flat=False)
 
-        walker_id, step_id = np.meshgrid(np.arange(n_walkers), np.arange(n_steps))
+        n_out = n_steps - burn_in
+        walker_id, step_id = np.meshgrid(np.arange(n_walkers), np.arange(n_out)+burn_in)
         walker_id = walker_id.flatten()
         step_id = step_id.flatten()
 
@@ -358,19 +372,41 @@ class BayesPRF(TSPlotter):
         )
         rsq = dag_get_rsq(tc_target=self.real_ts[idx,:], tc_fit=preds)        
         full_params[:,-1] = np.squeeze(rsq)
-        
-        # Now make a PRF object
-        self.sampler[idx] = TSPlotter(
-            prf_params=full_params,
-            model=self.model,
-            prfpy_model=self.prfpy_model,
-            real_ts=np.repeat(self.real_ts[idx,:][np.newaxis,...], full_params.shape[0], axis=0),
-        )
-        self.sampler[idx].pd_params['walker_id'] = walker_id
-        self.sampler[idx].pd_params['step_id'] = step_id
-        self.sampler[idx].pd_params['logprob'] = logprob.flatten()
+        id_to_keep = np.ones((len(rsq),), dtype=bool)
+        if save_top_kpsc is not None:
+            best_fits = np.argsort(rsq)[::-1][:int(save_top_kpsc/100 * len(rsq))]
+            print(f'Keeping top {save_top_kpsc}% of fits: = {len(best_fits)} fits')
+            id_to_keep = np.zeros((len(rsq),), dtype=bool)
+            id_to_keep[best_fits] = True
+        if save_min_rsq is not None:
+            id_to_keep &= (rsq > save_min_rsq)
+        # Get the best fits
+        full_params = full_params[id_to_keep,:]
+        logprob = logprob[id_to_keep]
+        walker_id = walker_id[id_to_keep]
+        step_id = step_id[id_to_keep]
 
-
+        if save_mode=='obj':        
+            # Now make a PRF object
+            self.sampler[idx] = TSPlotter(
+                prf_params=full_params,
+                model=self.model,
+                prfpy_model=self.prfpy_model,
+                real_ts=np.repeat(self.real_ts[idx,:][np.newaxis,...], full_params.shape[0], axis=0),
+            )
+            self.sampler[idx].pd_params['walker_id'] = walker_id
+            self.sampler[idx].pd_params['step_id'] = step_id
+            self.sampler[idx].pd_params['logprob'] = logprob.flatten()
+        elif save_mode=='minimal':
+            # Save only the important stuff... (don't want it to be too big)
+            self.sampler[idx] = {}
+            for p in self.model_labels.keys():
+                self.sampler[idx][p] = full_params[:,self.model_labels[p]]
+            self.sampler[idx]['rsq'] = full_params[:,-1]
+            self.sampler[idx]['walker_id'] = walker_id
+            self.sampler[idx]['step_id'] = step_id
+            self.sampler[idx]['logprob'] = logprob.flatten()
+            
 class BPFast():
     ''' BayesPRF 
     '''
@@ -518,28 +554,31 @@ class BPFast():
 
     # Log-likelihood function for the model
     def ln_likelihood(self, params):
-        ''' THIS IS DODGY - ASK REMCO
-        Vaguely following:
-        https://github.com/Joana-Carvalho/Micro-Probing/blob/master/computing_mcmc_tiny_ica.m
+        ''' 
         '''
         response = self.real_ts.copy()
         # [1] Get the predicted time series
         model_response = self.prfpy_model_wrapper(params)        
-        
+        if np.all(model_response == 0):
+            # For some reason 0
+            return -np.inf        
         # [2] Calculate the residuals
         residuals = response - model_response
 
         # [3] Fit a normal distribution to the residuals
-        muhat, sigmahat = stats.norm.fit(residuals)
+        # Assume mean of residuals is 0
+        # muhat, sigmahat = stats.norm.fit(residuals)
+        muhat = 0
+        _, sigmahat = stats.norm.fit(residuals, floc=0) 
 
-        # [4] Check if the spread is valid
-        if sigmahat <= 0:
-            return -np.inf
+        # Even faster? If we know mean is 0, don't want to fit std, but calculate it?
+        # sigmahat = np.std(residuals)           
 
-        # [5] Calculate the log likelihood of the residuals
-        # given the fitted normal distribution (feels a bit circular?)
+        # Calculate the log likelihood of the residuals
+        # given the fitted normal distribution
         # then add it up for all time points
-        log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
+        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
         return log_like
 
     # Log-prior function for the model
