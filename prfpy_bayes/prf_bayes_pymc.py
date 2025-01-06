@@ -13,7 +13,7 @@ from dag_prf_utils.prfpy_ts_plotter import *
 
 
 prfpy_global_model = PrfpyModelGlobal()
-class BayesPRF(TSPlotter):
+class BayesPRFPyMC(TSPlotter):
     ''' BayesPRF 
     A wrapper object meant to sit on top of prfpy models (https://github.com/VU-Cog-Sci/prfpy/tree/main/prfpy)
     Basically it sets up all the important elements needed for PRF fitting using MCMC (emcee toolbox)

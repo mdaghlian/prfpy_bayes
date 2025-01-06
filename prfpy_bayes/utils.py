@@ -1,7 +1,29 @@
 import numpy as np
 import os
 opj = os.path.join
+from contextlib import contextmanager
 
+@contextmanager
+def try_n_times(max_attempts=2):
+    """
+    Context manager that retries the enclosed block up to max_attempts times.
+    Sometimes first time round fitting fails for some reason...
+
+    :param max_attempts: Maximum number of retry attempts.
+    """
+    attempt = 0
+
+    while attempt < max_attempts:
+        try:
+            yield  # Executes the block inside the 'with' statement
+            break  # Exit if the block executes successfully
+        except Exception as e:
+            attempt += 1
+            print(f"Attempt {attempt} failed: {e}")
+            if attempt == max_attempts:
+                print("All attempts failed. Giving up.")
+                raise
+            print("Retrying...")
 
 class PrfpyModelGlobal():
     '''Make a prfpy model object that can be passed around
@@ -15,7 +37,8 @@ class PrfpyModelGlobal():
         self.prfpy_model = model
 
 def ln_likelihood(pred, response, **kwargs):
-    '''Calculate the log likelihood of the data given the predictions
+    '''Calculate the loglikelihood from the residuals of the prediction and the data
+    
     '''
     do_glm = kwargs.get('do_glm', False)    # Do the glm inside?
     # Automatic rejection - if all predictions are 0
@@ -32,11 +55,12 @@ def ln_likelihood(pred, response, **kwargs):
     # Residuals
     residuals = response - pred
 
-    # Likelihood
+    # Likelihood: we always assume residuals are gaussian
     # -> SOME NOTES ON WAYS YOU CAN DO THIS:
-    # A. Assume residuals have normal distribution, centred on 0, with std=std(residuals)
-    # B. Assume residuals have normal distribution, centred on 0, with std=1    
-    # C. Assume residuals have normal distribution, with mean and std estimated from the residuals
+    # A. Assume distribution, centred on 0, with std=std(residuals)
+    # B. Assume distribution, centred on 0, with std=1 (or some std based on what you expect the noise to be)   
+    #       perhaps this could even be a parameter to fit...?
+    # C. Assume distribution, with mean and std estimated from the residuals
 
     # Note that fitting the mean or std of residuals is equivalent to 
     # taking the mean and std; if they are gaussian (because optimizing MLE breaks down to this)
