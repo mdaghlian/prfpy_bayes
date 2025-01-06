@@ -1,7 +1,7 @@
 try:
-    from prfpy.model import *
-except:
     from prfpy_csenf.model import *
+except:
+    from prfpy.model import *
 
 import numpy as np
 from scipy import stats 
@@ -50,14 +50,17 @@ class BayesPRF(TSPlotter):
         self.model_sampler = {}                                     # A sampler for each parameter (e.g., randomly pick "x" b/w -5 and 5)
         self.model_prior = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
         self.model_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"
+        self.joint_prior = []                                       # Joint priors?
         self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
         self.bounds = {}
         self.init_walker_method = kwargs.get('init_walker_method', 'gauss_ball')   # How to setup the walkers? "random_prior", "gauss_ball" (see emcee docs)
-        # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
-        # NOT IMPLEMENTED (YET)
-        self.amp_method = kwargs.get('amp_method', 'glm')        
         self.gauss_ball_jitter = kwargs.get('gauss_ball_jitter', 1e-4)              # How much to jitter each parameter by
         self.sampler = [None] * self.n_vox                  # The sampler object for each voxel
+
+
+        # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
+        self.beta_method = kwargs.get('beta_method', 'mcmc') # glm or mcmc 
+        self.fixed_baseline = kwargs.get('fixed_baseline', None) # If using glm, fix baseline?      
 
     def add_prior(self, pid, prior_type, **kwargs):
         ''' 
@@ -123,14 +126,27 @@ class BayesPRF(TSPlotter):
                     prior_type = 'fixed',
                     fixed_val = bounds[v_p][0],
                     )
-                
+    def add_joint_prior(self, **kwargs):
+        '''
+        Add a joint prior to the model. 
+        '''
+        prior_id = kwargs.get('prior_id', )                
 
     def prep_info(self):
         ''' prep_info
         Set up object for fitting...
         i.e., check which parameters are fixed etc.
-        '''
-        self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)
+        '''        
+        self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)        
+        if self.beta_method=='glm':
+            self.do_glm = True
+            # Check is bold_baseline or amp_1 fixed?
+            if not 'bold_baseline' in self.fixed_vals.keys():
+                print('Warning - baseline is being fit in glm and mcmc')
+            if not 'amp_1' in self.fixed_vals.keys():
+                print('Warning - amp_1 is being fit in glm and mcmc')
+        else:
+            self.do_glm = False        
         self.all_p_list = list(self.model_labels.keys())                # List of *all* parameters names
         self.fix_p_list = list(self.fixed_vals.keys())                  # List of *fixed* parameter names 
         self.fit_p_list = list(
@@ -139,12 +155,13 @@ class BayesPRF(TSPlotter):
         self.init_p_id = {}                                             # Map from fitted parameter name to index (so we don't get lost)
         for i_p,p in enumerate(self.fit_p_list):
             self.init_p_id[p] = i_p        
+        # Make sure all the kwargs are correct
         
-
     def initialise_walkers(self, idx, n_walkers, **kwargs):
         ''' initialise_walkers for a given voxel
         '''
         init_walker_method = kwargs.get('init_walker_method', self.init_walker_method)
+        print(f'Initialising walkers for voxel {idx} using method: {init_walker_method}')
         initial_guess = kwargs.get('initial_guess', None) # What is our starting point
         if initial_guess is not None:
             kwargs['params_in'] = initial_guess # Set the initial guess
@@ -271,25 +288,13 @@ class BayesPRF(TSPlotter):
         model_response = self.prfpy_model_wrapper(params)        
         if np.all(model_response == 0):
             # For some reason 0
-            return -np.inf        
-        # [2] Calculate the residuals
-        residuals = response - model_response
-
-        # [3] Fit a normal distribution to the residuals
-        # Assume mean of residuals is 0
-        # muhat, sigmahat = stats.norm.fit(residuals)
-        muhat = 0
-        _, sigmahat = stats.norm.fit(residuals, floc=0) 
-
-        # Even faster? If we know mean is 0, don't want to fit std, but calculate it?
-        # sigmahat = np.std(residuals)           
-
-        # Calculate the log likelihood of the residuals
-        # given the fitted normal distribution
-        # then add it up for all time points
-        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
-        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
-
+            return -np.inf       
+        log_like = ln_likelihood(
+            pred=model_response,
+            response=response,
+            do_glm=self.do_glm,
+            fixed_baseline=self.fixed_baseline,            
+        )
         return log_like
 
     # Log-prior function for the model
@@ -298,6 +303,7 @@ class BayesPRF(TSPlotter):
         for v_p in self.fit_p_list:
             i_p = self.init_p_id[v_p]
             p_out += self.model_prior[v_p](params[i_p])
+
         return p_out    
 
     def ln_posterior(self, params, response):
@@ -310,10 +316,11 @@ class BayesPRF(TSPlotter):
         Run the MCMC fit for a given voxel
         '''
         pool            = kwargs.pop('pool', None)
-        save_mode       = kwargs.pop('save_mode', 'minimal') # What to save in 'sampler': can be obj or minimal
-        save_top_kpsc   = kwargs.pop('save_top_kpsc', 15) # Keep the top n % (in terms of model fit)
-        save_min_rsq    = kwargs.pop('save_min_rsq', 0.1) # Only save if the rsq is above this
+        save_mode       = kwargs.pop('save_mode', 'obj') # What to save in 'sampler': can be obj or minimal
+        save_top_kpsc   = kwargs.pop('save_top_kpsc', None) # Keep the top n % (in terms of model fit)
+        save_min_rsq    = kwargs.pop('save_min_rsq', None) # Only save if the rsq is above this
         burn_in         = kwargs.pop('burn_in', 0) # How many steps to burn in
+        bound_enforce   = kwargs.pop('bound_enforce', False) # Enforce bounds?
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
         walkers = self.initialise_walkers(idx=idx, n_walkers=n_walkers, **kwargs)        
@@ -354,7 +361,7 @@ class BayesPRF(TSPlotter):
         # Return the chain, log_prob, 
         chain = sampler.get_chain(discard=burn_in, flat=False)
         flat_params = chain.reshape(-1, self.n_params2fit)        
-        logprob = sampler.get_log_prob(discard=burn_in, flat=False)
+        logprob = sampler.get_log_prob(discard=burn_in, flat=True)
 
         n_out = n_steps - burn_in
         walker_id, step_id = np.meshgrid(np.arange(n_walkers), np.arange(n_out)+burn_in)
@@ -370,6 +377,30 @@ class BayesPRF(TSPlotter):
         preds = self.prfpy_model.return_prediction(
             *list(np.array(full_params[:,:-1].T))
         )
+        # GLM? 
+        if self.beta_method=='glm':
+            slopes, baselines = quick_glm(
+                response=self.real_ts[idx,:],
+                preds=preds,
+                fixed_baseline=self.fixed_baseline,
+            )
+            # Ok now lets add it back in
+            # -> for all models we can simply plug in the baseline
+            full_params[:,self.model_labels['bold_baseline']] = baselines
+            # For most models we simply plug in the slope (except, dog and norm)
+            if self.model not in ['dog', 'norm']:
+                full_params[:,self.model_labels['amp_1']] *= slopes # Multiply in...
+            elif self.model=='dog':
+                full_params[:,self.model_labels['amp_1']] *= slopes
+                full_params[:,self.model_labels['amp_2']] *= slopes
+            elif self.model=='norm':
+                full_params[:,self.model_labels['amp_1']] *= slopes
+                full_params[:,self.model_labels['b_val']] *= slopes
+            # Now recalculate the predictions
+            preds = self.prfpy_model.return_prediction(
+                *list(np.array(full_params[:,:-1].T))
+            )
+                
         rsq = dag_get_rsq(tc_target=self.real_ts[idx,:], tc_fit=preds)        
         full_params[:,-1] = np.squeeze(rsq)
         id_to_keep = np.ones((len(rsq),), dtype=bool)
@@ -380,6 +411,16 @@ class BayesPRF(TSPlotter):
             id_to_keep[best_fits] = True
         if save_min_rsq is not None:
             id_to_keep &= (rsq > save_min_rsq)
+        if bound_enforce:
+            # Enforce bounds - for those parameters which are fit & have bounds 
+            out_bounds = np.zeros(len(flat_params), dtype=bool)
+            for i_p, p in enumerate(self.bounds.keys()):
+                if p not in self.fit_p_list:
+                    continue
+                out_bounds += (full_params[:,i_p] < self.bounds[p][0])
+                out_bounds += (full_params[:,i_p] > self.bounds[p][1])
+            print(f'Enforcing bounds: {np.sum(out_bounds)} out of bounds')            
+            id_to_keep &= ~out_bounds
         # Get the best fits
         full_params = full_params[id_to_keep,:]
         logprob = logprob[id_to_keep]
@@ -406,7 +447,7 @@ class BayesPRF(TSPlotter):
             self.sampler[idx]['walker_id'] = walker_id
             self.sampler[idx]['step_id'] = step_id
             self.sampler[idx]['logprob'] = logprob.flatten()
-            
+
 class BPFast():
     ''' BayesPRF 
     '''
@@ -417,6 +458,7 @@ class BPFast():
         '''
         self.model_labels = prfpy_params_dict()[model]
         self.real_ts = real_ts.squeeze()
+        self.sumd = np.sum(self.real_ts, axis=0)
         # Setup and save model information:
         self.n_params = len(self.model_labels) - 1
         self.model_labels_inv = {value: key for key, value in self.model_labels.items()}        
@@ -426,6 +468,9 @@ class BPFast():
         self.model_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"        
         self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
         self.bounds = {}
+        # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
+        self.beta_method = kwargs.get('beta_method', 'mcmc') # glm or mcmc 
+        self.fixed_baseline = kwargs.get('fixed_baseline', None) # If using glm, fix baseline?      
 
     def add_prior(self, pid, prior_type, **kwargs):
         ''' 
@@ -498,6 +543,16 @@ class BPFast():
         i.e., check which parameters are fixed etc.
         '''
         self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)
+        self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)        
+        if self.beta_method=='glm':
+            self.do_glm = True
+            # Check is bold_baseline or amp_1 fixed?
+            if not 'bold_baseline' in self.fixed_vals.keys():
+                print('Warning - baseline is being fit in glm and mcmc')
+            if not 'amp_1' in self.fixed_vals.keys():
+                print('Warning - amp_1 is being fit in glm and mcmc')
+        else:
+            self.do_glm = False                
         self.all_p_list = list(self.model_labels.keys())                # List of *all* parameters names
         self.fix_p_list = list(self.fixed_vals.keys())                  # List of *fixed* parameter names 
         self.fit_p_list = list(
@@ -558,27 +613,17 @@ class BPFast():
         '''
         response = self.real_ts.copy()
         # [1] Get the predicted time series
-        model_response = self.prfpy_model_wrapper(params)        
+        model_response = self.prfpy_model_wrapper(params)    
         if np.all(model_response == 0):
             # For some reason 0
-            return -np.inf        
-        # [2] Calculate the residuals
-        residuals = response - model_response
-
-        # [3] Fit a normal distribution to the residuals
-        # Assume mean of residuals is 0
-        # muhat, sigmahat = stats.norm.fit(residuals)
-        muhat = 0
-        _, sigmahat = stats.norm.fit(residuals, floc=0) 
-
-        # Even faster? If we know mean is 0, don't want to fit std, but calculate it?
-        # sigmahat = np.std(residuals)           
-
-        # Calculate the log likelihood of the residuals
-        # given the fitted normal distribution
-        # then add it up for all time points
-        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
-        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
+            return -np.inf    
+        log_like = ln_likelihood(
+            pred=model_response,
+            response=response,
+            do_glm=self.do_glm,
+            fixed_baseline=self.fixed_baseline,
+            sumd=self.sumd,
+        )
         return log_like
 
     # Log-prior function for the model

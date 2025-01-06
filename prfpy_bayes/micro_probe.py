@@ -5,9 +5,9 @@ import copy
 
 # Import the prfpy model
 try: 
-    from prfpy.model import *
-except:
     from prfpy_csenf.model import *
+except:
+    from prfpy.model import *
 from .utils import *
 from dag_prf_utils.prfpy_ts_plotter import TSPlotter
 from dag_prf_utils.utils import dag_get_rsq
@@ -67,38 +67,11 @@ class MicroProbe():
             baseline=np.array([0]),
         ).squeeze()
         if np.all(pred == 0):
-            # For some reason 0
             return -np.inf
-        # Estimate slope and offset using calssical GLM and OLS
-        if self.fixed_baseline is not None:
-            offset = self.fixed_baseline
-            # Vectorized computation of slopes
-            pred_squares = np.sum(pred**2)
-            slope = np.sum(response * pred) / pred_squares            
-        else:
-            m_response = np.mean(response) # slightly faster
-            m_pred = np.mean(pred) 
-            pred_minus_mean = pred - m_pred  # Only do it once
-            # Faster with @, but below is equivalent to...
-            # >> slope = np.sum((response - m_response) * pred_minus_mean) / np.sum(pred_minus_mean **2)
-            slope = (response - m_response) @ pred_minus_mean / (pred_minus_mean @ pred_minus_mean)
-            offset = m_response - slope * m_pred
-        pred = pred * slope + offset
-
-        # Calculate log likelihood
-        residuals = response - pred        
-        # Estimate mean and std of the residuals (assuming normal distribution)
-        # Assume mean of residuals is 0
-        # muhat, sigmahat = stats.norm.fit(residuals)
-        muhat = 0
-        _, sigmahat = stats.norm.fit(residuals, floc=0)    
-        
-
-        # Calculate the log likelihood of the residuals
-        # given the fitted normal distribution
-        # then add it up for all time points
-        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
-        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
+        log_like = ln_likelihood(
+            pred=pred, response=response, 
+            fixed_baseline=self.fixed_baseline, 
+        )
         return log_like
     
     def ln_posterior(self, params, response):
@@ -194,7 +167,7 @@ class MicroProbe():
         chain = sampler.get_chain(discard=burn_in, flat=False)
         # Flatten the chains....
         flat_params = chain.reshape(-1, n_paramss2fit)
-        logprob = sampler.get_log_prob(discard=burn_in, flat=False).reshape(-1, 1).flatten()
+        logprob = sampler.get_log_prob(discard=burn_in, flat=True)
 
         n_out = n_steps - burn_in
         # Get the index of the walkers, and the steps
@@ -288,7 +261,6 @@ class MicroProbe():
     
 
 
-
 class MPFast():
     '''Same as above, but smaller stuff so it is faster to pickle
     (should speed up the parallel processing)
@@ -301,7 +273,7 @@ class MPFast():
         '''
         self.model='gauss'
         self.real_ts = real_ts.squeeze()
-        self.m_response = np.mean(self.real_ts)
+        self.sumd = np.sum(self.real_ts) # Add it once, not on every loop... (save a bit of time)
 
         # DEFAULTS 
         self.bounds = kwargs.get('bounds', [-5, 5])
@@ -341,42 +313,13 @@ class MPFast():
             baseline=np.array([0]),
         ).squeeze()
         if np.all(pred == 0):
-            # For some reason 0
-            return -np.inf
-        # Estimate slope and offset using calssical GLM and OLS
-        if self.fixed_baseline is not None:
-            offset = self.fixed_baseline
-            # Vectorized computation of slopes
-            pred_squares = np.sum(pred**2)
-            slope = np.sum(response * pred) / pred_squares            
-        else:
-            m_response = self.m_response # slightly faster
-            m_pred = np.mean(pred) 
-            pred_minus_mean = pred - m_pred  # Only do it once
-            # Faster with @, but below is equivalent to...
-            # >> slope = np.sum((response - m_response) * pred_minus_mean) / np.sum(pred_minus_mean **2)
-            slope = (response - m_response) @ pred_minus_mean / (pred_minus_mean @ pred_minus_mean)
-            offset = m_response - slope * m_pred
-        pred = pred * slope + offset
+            return -np.inf        
+        log_like = ln_likelihood(
+            pred=pred, response=response, 
+            fixed_baseline=self.fixed_baseline, 
+            sumd=self.sumd,
+        )
 
-        # Calculate log likelihood
-        residuals = response - pred        
-        # Estimate mean and std of the residuals (assuming normal distribution)
-        # Assume mean of residuals is 0
-        # muhat, sigmahat = stats.norm.fit(residuals)
-        muhat = 0
-        _, sigmahat = stats.norm.fit(residuals, floc=0) 
-        sigmahat_v2 = np.std(residuals) # Faster to calculate it this way
-        print(f'v1: {sigmahat} v2: {sigmahat_v2}')
-
-        # Even faster? If we know mean is 0, don't want to fit std, but calculate it?
-        # sigmahat = np.std(residuals)           
-
-        # Calculate the log likelihood of the residuals
-        # given the fitted normal distribution
-        # then add it up for all time points
-        # SLOWER TO CALL OUT TO LIBRARIES: log_like = stats.norm.logpdf(residuals, muhat, sigmahat).sum()
-        log_like = -0.5 * np.sum((residuals / sigmahat) ** 2 + np.log(2 * np.pi * sigmahat**2))
         return log_like
     
     def ln_posterior(self, params):

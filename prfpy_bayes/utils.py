@@ -18,9 +18,6 @@ def ln_likelihood(pred, response, **kwargs):
     '''Calculate the log likelihood of the data given the predictions
     '''
     do_glm = kwargs.get('do_glm', False)    # Do the glm inside?
-    fixed_baseline = kwargs.get('fixed_baseline', None) # If doing glm, fix the baseline?
-    m_response = kwargs.get('m_response', None) # If doing glm, do we might have precomputed the mean for speed
-
     # Automatic rejection - if all predictions are 0
     if np.all(pred == 0):
         return -np.inf
@@ -28,9 +25,7 @@ def ln_likelihood(pred, response, **kwargs):
     # A GLM, before?
     if do_glm:
         slopes, baselines = quick_glm(
-            pred, response, 
-            fixed_baseline=fixed_baseline, 
-            m_response=m_response
+            pred, response, **kwargs
             )
         pred = pred* slopes + baselines
 
@@ -66,30 +61,24 @@ def quick_glm(preds, response, **kwargs):
     response (ndarray): 2D array (n_timepoints x 1) representing the observed responses at each timepoint.
     **kwargs: Additional optional arguments:
         - 'fixed_baseline': If provided, this will be used as the baseline value and slopes will be computed based on this fixed value.
-        - 'm_response': A pre-computed sum of the response values, defaults to the sum of the `response` along the first axis (timepoints).
+        - 'sumd': A pre-computed sum of the response values
     
     Returns:
     slopes (ndarray): The calculated slopes for each predictor.
     baselines (ndarray): The estimated baseline for each predictor.
     '''
     # Get optional arguments
-    fixed_baseline = kwargs.get('fixed_baseline', None)
-    m_response = kwargs.get('m_response', np.sum(response, axis=0))
-    
+    fixed_baseline = kwargs.get('fixed_baseline', None)    
     # If preds is a 1D array, convert it into a 2D array (single row)
     if len(preds.shape) == 1:
-        preds = preds[np.newaxis, :]
+        preds = preds[np.newaxis, :]        
     
     # Get the number of predictors (n_preds) and the number of timepoints (n_timepoints)
     n_preds, n_timepoints = preds.shape
-    
     # Initialize arrays for slopes and baselines, with zeros
     slopes = np.zeros((n_preds,))
     baselines = np.zeros((n_preds,))
     
-
-    # Store the sum of response values, m_response, for later use
-    sumd = m_response    
     # Compute the square of the norm of the predictions along each row (for each predictor)
     square_norm_preds = np.sum(preds**2, axis=-1)    
     # Compute the sum of predictions for each predictor across timepoints
@@ -105,6 +94,7 @@ def quick_glm(preds, response, **kwargs):
     else:
         # If no fixed baseline is provided, compute slopes and baselines using least-squares estimation        
         # Compute the slopes for each predictor based on the formula
+        sumd = kwargs.get('sumd', np.sum(response, axis=0)) # pre-computed sum of the response values (speed!)
         slopes = (n_timepoints * np.dot(response, preds.T) - sumd * sum_preds) / (n_timepoints * square_norm_preds - sum_preds**2)
         
         # Compute the baselines using the formula derived from the linear system
