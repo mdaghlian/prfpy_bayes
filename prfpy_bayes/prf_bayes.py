@@ -464,6 +464,31 @@ class BayesPRF(TSPlotter):
             self.sampler[idx]['step_id'] = step_id
             self.sampler[idx]['logprob'] = logprob.flatten()
 
+    def sampler_minimal_to_obj(self):
+        '''Expand it out to the full object
+
+        '''
+        for i in range(len(self.sampler)):
+            if type(self.sampler[i])==dict:
+                n_samples  = len(self.sampler[i]['logprob'])
+                prf_params_np = np.zeros((n_samples, len(self.model_labels)))
+                for p in self.model_labels.keys():
+                    prf_params_np[:,self.model_labels[p]] = self.sampler[i][p]
+                # Make a new object
+                splot = TSPlotter(
+                    prf_params=prf_params_np,
+                    model=self.model,
+                    prfpy_model=self.prfpy_model,
+                    real_ts=np.repeat(self.real_ts[i,:][np.newaxis,...], self.sampler[i]['amp_1'].shape[0], axis=0),
+                )
+                
+                # Add the logprob and walker_id
+                splot.pd_params['walker_id'] = self.sampler[i]['walker_id']
+                splot.pd_params['step_id']   = self.sampler[i]['step_id']
+                splot.pd_params['logprob']   = self.sampler[i]['logprob']
+                self.sampler[i] = splot
+
+
 class BPFast():
     ''' BayesPRF 
     '''
