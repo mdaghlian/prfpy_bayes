@@ -156,6 +156,11 @@ class BayesPRF(TSPlotter):
         for i_p,p in enumerate(self.fit_p_list):
             self.init_p_id[p] = i_p        
         # Make sure all the kwargs are correct
+        print(f'Parameters to fit are {self.fit_p_list}')
+        print(f'Beta method is {self.beta_method}')
+        if self.fixed_baseline is not None:
+            print(f'Fixed baseline is {self.fixed_baseline} (not including baseline in glm)')
+
         
     def initialise_walkers(self, idx, n_walkers, **kwargs):
         ''' initialise_walkers for a given voxel
@@ -322,6 +327,8 @@ class BayesPRF(TSPlotter):
 
     def ln_posterior(self, params, response):
         prior = self.ln_prior(params)
+        if np.isinf(prior):
+            return -np.inf, -np.inf
         like = self.ln_likelihood(params, response)
         return prior + like, like # save both...
 
@@ -337,6 +344,7 @@ class BayesPRF(TSPlotter):
         bound_enforce   = kwargs.pop('bound_enforce', False) # Enforce bounds?
         kwargs_sampler  = kwargs.get('kwargs_sampler', {})
         kwargs_run      = kwargs.get('kwargs_run', {})
+        return_sampler = kwargs.get('return_sampler', False)
         walkers = self.initialise_walkers(idx=idx, n_walkers=n_walkers, **kwargs)        
         # bloop
         n_walkers = len(walkers)
@@ -463,6 +471,8 @@ class BayesPRF(TSPlotter):
             self.sampler[idx]['walker_id'] = walker_id
             self.sampler[idx]['step_id'] = step_id
             self.sampler[idx]['logprob'] = logprob.flatten()
+        if return_sampler:
+            return sampler
 
     def sampler_minimal_to_obj(self):
         '''Expand it out to the full object
@@ -677,6 +687,8 @@ class BPFast():
 
     def ln_posterior(self, params):
         prior = self.ln_prior(params)
+        if np.isinf(prior): # If the prior is infinite, then the posterior is infinite
+            return -np.inf, -np.inf
         like = self.ln_likelihood(params)
         return prior + like, like # save both...
 
