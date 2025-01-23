@@ -47,12 +47,14 @@ class BayesPRF(TSPlotter):
         self.model_labels_inv = {value: key for key, value in self.model_labels.items()}
         
         # MCMC specific information
-        self.model_sampler = {}                                     # A sampler for each parameter (e.g., randomly pick "x" b/w -5 and 5)
-        self.model_prior = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
-        self.model_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"
-        self.joint_prior = []                                       # Joint priors?
-        self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
-        self.bounds = {}
+        self.p_prior = {}
+        self.p_bounds = {}
+        self.p_sampler_fn = {}                                     # A sampler for each parameter (e.g., randomly pick "x" b/w -5 and 5)        
+        self.p_prior_fn = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
+        self.p_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"
+        self.p_latent_transform = {}                            # For each parameter: is it a latent parameter? (i.e., transformed by NCDF)        
+        self.p_fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
+
         self.init_walker_method = kwargs.get('init_walker_method', 'gauss_ball')   # How to setup the walkers? "random_prior", "gauss_ball" (see emcee docs)
         self.gauss_ball_jitter = kwargs.get('gauss_ball_jitter', 1e-4)              # How much to jitter each parameter by
         self.sampler = [None] * self.n_vox                  # The sampler object for each voxel
@@ -80,75 +82,105 @@ class BayesPRF(TSPlotter):
         if pid not in self.model_labels.keys(): # Is this a valid parameter to add? 
             print('error...')
             return
-        self.model_prior_type[pid] = prior_type 
+        self.p_prior_type[pid] = prior_type 
+        self.p_latent_transform[pid] = lambda x: x # Default is no transform
         if prior_type=='normal':
             # Get loc, and scale
             loc = kwargs.get('loc')    
-            scale = kwargs.get('scale')    
-            self.model_sampler[pid] = PriorNorm(loc, scale).sampler 
-            self.model_prior[pid]   = PriorNorm(loc, scale).prior            
+            scale = kwargs.get('scale')   
+            self.p_prior = PriorNorm(loc, scale) 
+            self.p_sampler_fn[pid] = self.p_prior[pid].sampler
+            self.p_prior[pid]   = self.p_prior[pid].prior
+        
+        elif prior_type=='latent_uniform':
+            # Latent reparameterization:
+            # latent par is normal with mean 0 and std 1
+            # actual par is transformed by NCDF 
+            vmin = kwargs.get('vmin')
+            vmax = kwargs.get('vmax')
+            self.p_prior[pid] = PriorNorm(0, 1)
+            self.p_bounds[pid] = [vmin, vmax]
+            self.p_latent_transform[pid] = LatentTrans(vmin, vmax).transform
 
         elif prior_type=='uniform' :
             vmin = kwargs.get('vmin')
             vmax = kwargs.get('vmax')
-            self.bounds[pid] = [vmin, vmax]
-            self.model_sampler[pid] = PriorUniform(vmin, vmax).sampler
-            self.model_prior[pid] = PriorUniform(vmin, vmax).prior            
+            self.p_bounds[pid] = [vmin, vmax]
+            self.p_prior[pid] = PriorUniform(vmin, vmax)
 
         elif prior_type=='fixed':
             fixed_val = kwargs.get('fixed_val')
-            self.bounds[pid] = [fixed_val, fixed_val]
-            self.fixed_vals[pid] = fixed_val
-            self.model_prior[pid] = PriorFixed(fixed_val).prior
-
+            self.p_bounds[pid] = [fixed_val, fixed_val]
+            self.p_fixed_vals[pid] = fixed_val
+            self.p_prior[pid] = PriorFixed(fixed_val)
         elif prior_type=='none':
-            self.model_prior[pid] = PriorNone().prior            
+            self.p_prior[pid] = PriorNone().prior    
+
+        self.p_prior_fn[pid] = self.p_prior[pid].prior
+        self.p_sampler_fn[pid] = self.p_prior[pid].sampler
+
+    def return_prior_info(self):
+        ''' return_prior_info
+        Return the prior information for each parameter
+        '''
+        prior_info = {}
+        for p in self.model_labels.keys():
+            if p=='rsq':
+                continue
+            prior_info[p] = {
+                'prior_type': self.p_prior_type.get(p, None),
+                'fixed_val': self.p_fixed_vals.get(p, None),
+                'loc' : self.p_prior.get(p, {}).get('loc'),
+                'scale' : self.p_prior.get(p, {}).get('scale'),
+                'vmin' : self.p_prior.get(p, {}).get('vmin'),
+                'vmax' : self.p_prior.get(p, {}).get('vmax'),
+            }
+        return prior_info
     
-    def add_priors_from_bounds(self, bounds):
+    def add_priors_from_dict(self, prior_dict):
+        '''
+        Add priors from a dictionary
+        '''
+        for p in prior_dict.keys():
+            self.add_prior(
+                pid=p,
+                **prior_dict[p]
+            )
+
+    def add_priors_from_bounds(self, bounds, **kwargs):
         '''
         Used to setup uninformative priors: i.e., uniform between the bouds
         Can setup more informative, like a normal using the other methods        
-        '''        
+        '''
+        prior_type = kwargs.pop('prior_type', 'uniform')        
         for i_p, v_p in enumerate(self.model_labels.keys()):
             if v_p=='rsq':
                 continue
-
-            if bounds[v_p][0]!=bounds[v_p][1]: 
-                self.add_prior(
-                    pid=v_p,
-                    prior_type = 'uniform',
-                    vmin = bounds[v_p][0],
-                    vmax = bounds[v_p][1],
-                    )
-            else: # If upper & lower bound are the same, make it a fixed parameter
-                self.add_prior(
-                    pid=v_p,
-                    prior_type = 'fixed',
-                    fixed_val = bounds[v_p][0],
-                    )
-    def add_joint_prior(self, **kwargs):
-        '''
-        Add a joint prior to the model. 
-        '''
-        prior_id = kwargs.get('prior_id', )                
+            self.add_prior(
+                pid=v_p,
+                prior_type = prior_type,
+                vmin = bounds[v_p][0],
+                vmax = bounds[v_p][1],
+                **kwargs
+                )
 
     def prep_info(self):
         ''' prep_info
         Set up object for fitting...
         i.e., check which parameters are fixed etc.
         '''        
-        self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)        
+        self.n_params2fit = self.n_params - len(self.p_fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)        
         if self.beta_method=='glm':
             self.do_glm = True
             # Check is bold_baseline or amp_1 fixed?
-            if not 'bold_baseline' in self.fixed_vals.keys():
+            if not 'bold_baseline' in self.p_fixed_vals.keys():
                 print('Warning - baseline is being fit in glm and mcmc')
-            if not 'amp_1' in self.fixed_vals.keys():
+            if not 'amp_1' in self.p_fixed_vals.keys():
                 print('Warning - amp_1 is being fit in glm and mcmc')
         else:
             self.do_glm = False        
         self.all_p_list = list(self.model_labels.keys())                # List of *all* parameters names
-        self.fix_p_list = list(self.fixed_vals.keys())                  # List of *fixed* parameter names 
+        self.fix_p_list = list(self.p_fixed_vals.keys())                  # List of *fixed* parameter names 
         self.fit_p_list = list(
             x for x in self.all_p_list if x not in self.fix_p_list)     # List of *fitted* parameter names 
         self.fit_p_list = [i for i in self.fit_p_list if i!='rsq']
@@ -195,7 +227,7 @@ class BayesPRF(TSPlotter):
         for iw in range(n_walkers):
             params = np.zeros(self.n_params2fit)
             for i_p,p in enumerate(self.fit_p_list):
-                params[i_p] = self.model_sampler[p](1)
+                params[i_p] = self.p_sampler_fn[p](1)
             walker_start.append(np.array(params))
         return walker_start
     
@@ -246,7 +278,7 @@ class BayesPRF(TSPlotter):
         ''' initialize walkers on a grid based on the bounds'''
         walker_start = []
         for i_p, p in enumerate(self.fit_p_list):
-            vmin, vmax = self.bounds[p]
+            vmin, vmax = self.p_bounds[p]
             walker_start.append(np.linspace(vmin, vmax, n_walkers))
         # Meshgrid
         walker_start = np.meshgrid(*walker_start)
@@ -285,11 +317,15 @@ class BayesPRF(TSPlotter):
         for p in self.fit_p_list:
             fit_p_id = self.init_p_id[p]
             full_p_id = self.model_labels[p]
-            new_params[full_p_id] = params[fit_p_id]
+            if p in self.p_latent_transform.keys():
+                # Apply transform
+                new_params[full_p_id] = self.p_latent_transform[p](params[fit_p_id])
+            else:
+                new_params[full_p_id] = params[fit_p_id]
         # Insert fixed params:
-        for v_p in self.fixed_vals.keys():
+        for v_p in self.p_fixed_vals.keys():
             i_p = self.model_labels[v_p]        
-            new_params[i_p] = self.fixed_vals[v_p]
+            new_params[i_p] = self.p_fixed_vals[v_p]
         return new_params
 
     def prfpy_model_wrapper(self, params):
@@ -321,7 +357,7 @@ class BayesPRF(TSPlotter):
         p_out = 0.0
         for v_p in self.fit_p_list:
             i_p = self.init_p_id[v_p]
-            p_out += self.model_prior[v_p](params[i_p])
+            p_out += self.p_prior_fn[v_p](params[i_p])
 
         return p_out    
 
@@ -360,7 +396,7 @@ class BayesPRF(TSPlotter):
             # Now make the fast one
             bpfast = BPFast(model=self.model, real_ts=self.real_ts[idx,:].copy(), **self.kwargs)
             # Add bounds
-            bpfast.add_priors_from_bounds(self.bounds)
+            bpfast.add_priors_from_bounds(self.p_bounds)
             bpfast.prep_info()
             # Run a quick test
             bpfast.ln_posterior(walkers[0])
@@ -438,11 +474,11 @@ class BayesPRF(TSPlotter):
         if bound_enforce:
             # Enforce bounds - for those parameters which are fit & have bounds 
             out_bounds = np.zeros(len(flat_params), dtype=bool)
-            for i_p, p in enumerate(self.bounds.keys()):
+            for i_p, p in enumerate(self.p_bounds.keys()):
                 if p not in self.fit_p_list:
                     continue
-                out_bounds += (full_params[:,i_p] < self.bounds[p][0])
-                out_bounds += (full_params[:,i_p] > self.bounds[p][1])
+                out_bounds += (full_params[:,i_p] < self.p_bounds[p][0])
+                out_bounds += (full_params[:,i_p] > self.p_bounds[p][1])
             print(f'Enforcing bounds: {np.sum(out_bounds)} out of bounds')            
             id_to_keep &= ~out_bounds
         # Get the best fits
@@ -514,11 +550,12 @@ class BPFast():
         self.n_params = len(self.model_labels) - 1
         self.model_labels_inv = {value: key for key, value in self.model_labels.items()}        
         # MCMC specific information
-        self.model_sampler = {}                                     # A sampler for each parameter (e.g., randomly pick "x" b/w -5 and 5)
-        self.model_prior = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
-        self.model_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"        
-        self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
-        self.bounds = {}
+        self.p_prior = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
+        self.p_prior_fn = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
+        self.p_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"        
+        self.p_sampler_fn = {}                                     # A sampler for each parameter (e.g., randomly pick "x" b/w -5 and 5)
+        self.p_fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
+        self.p_bounds = {}
         # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
         self.beta_method = kwargs.get('beta_method', 'mcmc') # glm or mcmc 
         self.fixed_baseline = kwargs.get('fixed_baseline', None) # If using glm, fix baseline?      
@@ -541,71 +578,106 @@ class BPFast():
         if pid not in self.model_labels.keys(): # Is this a valid parameter to add? 
             print('error...')
             return
-        self.model_prior_type[pid] = prior_type 
+        self.p_prior_type[pid] = prior_type 
+        self.p_latent_transform[pid] = lambda x: x # Default is no transform
         if prior_type=='normal':
             # Get loc, and scale
             loc = kwargs.get('loc')    
-            scale = kwargs.get('scale')    
-            self.model_sampler[pid] = PriorNorm(loc, scale).sampler 
-            self.model_prior[pid]   = PriorNorm(loc, scale).prior            
+            scale = kwargs.get('scale')   
+            self.p_prior = PriorNorm(loc, scale) 
+            self.p_sampler_fn[pid] = self.p_prior[pid].sampler
+            self.p_prior[pid]   = self.p_prior[pid].prior
+        
+        elif prior_type=='latent_uniform':
+            # Latent reparameterization:
+            # latent par is normal with mean 0 and std 1
+            # actual par is transformed by NCDF 
+            vmin = kwargs.get('vmin')
+            vmax = kwargs.get('vmax')
+            self.p_prior[pid] = PriorNorm(0, 1)
+            self.p_bounds[pid] = [vmin, vmax]
+            self.p_latent_transform[pid] = LatentTrans(vmin, vmax).transform
 
         elif prior_type=='uniform' :
             vmin = kwargs.get('vmin')
             vmax = kwargs.get('vmax')
-            self.bounds[pid] = [vmin, vmax]
-            self.model_sampler[pid] = PriorUniform(vmin, vmax).sampler
-            self.model_prior[pid] = PriorUniform(vmin, vmax).prior            
+            self.p_bounds[pid] = [vmin, vmax]
+            self.p_prior[pid] = PriorUniform(vmin, vmax)
 
         elif prior_type=='fixed':
             fixed_val = kwargs.get('fixed_val')
-            self.bounds[pid] = [fixed_val, fixed_val]
-            self.fixed_vals[pid] = fixed_val
-            self.model_prior[pid] = PriorFixed(fixed_val).prior
-
+            self.p_bounds[pid] = [fixed_val, fixed_val]
+            self.p_fixed_vals[pid] = fixed_val
+            self.p_prior[pid] = PriorFixed(fixed_val)
         elif prior_type=='none':
-            self.model_prior[pid] = PriorNone().prior            
+            self.p_prior[pid] = PriorNone().prior    
+
+        self.p_prior_fn[pid] = self.p_prior[pid].prior
+        self.p_sampler_fn[pid] = self.p_prior[pid].sampler
+
+    def return_prior_info(self):
+        ''' return_prior_info
+        Return the prior information for each parameter
+        '''
+        prior_info = {}
+        for p in self.model_labels.keys():
+            if p=='rsq':
+                continue
+            prior_info[p] = {
+                'prior_type': self.p_prior_type.get(p, None),
+                'fixed_val': self.p_fixed_vals.get(p, None),
+                'loc' : self.p_prior.get(p, {}).get('loc'),
+                'scale' : self.p_prior.get(p, {}).get('scale'),
+                'vmin' : self.p_prior.get(p, {}).get('vmin'),
+                'vmax' : self.p_prior.get(p, {}).get('vmax'),
+            }
+        return prior_info
     
-    def add_priors_from_bounds(self, bounds):
+    def add_priors_from_dict(self, prior_dict):
+        '''
+        Add priors from a dictionary
+        '''
+        for p in prior_dict.keys():
+            self.add_prior(
+                pid=p,
+                **prior_dict[p]
+            )
+
+    def add_priors_from_bounds(self, bounds, **kwargs):
         '''
         Used to setup uninformative priors: i.e., uniform between the bouds
         Can setup more informative, like a normal using the other methods        
-        '''        
+        '''
+        prior_type = kwargs.pop('prior_type', 'uniform')        
         for i_p, v_p in enumerate(self.model_labels.keys()):
             if v_p=='rsq':
                 continue
+            self.add_prior(
+                pid=v_p,
+                prior_type = prior_type,
+                vmin = bounds[v_p][0],
+                vmax = bounds[v_p][1],
+                **kwargs
+                )
 
-            if bounds[v_p][0]!=bounds[v_p][1]: 
-                self.add_prior(
-                    pid=v_p,
-                    prior_type = 'uniform',
-                    vmin = bounds[v_p][0],
-                    vmax = bounds[v_p][1],
-                    )
-            else: # If upper & lower bound are the same, make it a fixed parameter
-                self.add_prior(
-                    pid=v_p,
-                    prior_type = 'fixed',
-                    fixed_val = bounds[v_p][0],
-                    )
-                
     def prep_info(self):
         ''' prep_info
         Set up object for fitting...
         i.e., check which parameters are fixed etc.
         '''
-        self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)
-        self.n_params2fit = self.n_params - len(self.fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)        
+        self.n_params2fit = self.n_params - len(self.p_fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)
+        self.n_params2fit = self.n_params - len(self.p_fixed_vals)        # Number of parameters to fit (i.e., not the ones being fixed)        
         if self.beta_method=='glm':
             self.do_glm = True
             # Check is bold_baseline or amp_1 fixed?
-            if not 'bold_baseline' in self.fixed_vals.keys():
+            if not 'bold_baseline' in self.p_fixed_vals.keys():
                 print('Warning - baseline is being fit in glm and mcmc')
-            if not 'amp_1' in self.fixed_vals.keys():
+            if not 'amp_1' in self.p_fixed_vals.keys():
                 print('Warning - amp_1 is being fit in glm and mcmc')
         else:
             self.do_glm = False                
         self.all_p_list = list(self.model_labels.keys())                # List of *all* parameters names
-        self.fix_p_list = list(self.fixed_vals.keys())                  # List of *fixed* parameter names 
+        self.fix_p_list = list(self.p_fixed_vals.keys())                  # List of *fixed* parameter names 
         self.fit_p_list = list(
             x for x in self.all_p_list if x not in self.fix_p_list)     # List of *fitted* parameter names 
         self.fit_p_list = [i for i in self.fit_p_list if i!='rsq']
@@ -647,9 +719,9 @@ class BPFast():
             full_p_id = self.model_labels[p]
             new_params[full_p_id] = params[fit_p_id]
         # Insert fixed params:
-        for v_p in self.fixed_vals.keys():
+        for v_p in self.p_fixed_vals.keys():
             i_p = self.model_labels[v_p]        
-            new_params[i_p] = self.fixed_vals[v_p]
+            new_params[i_p] = self.p_fixed_vals[v_p]
         return new_params
 
     def prfpy_model_wrapper(self, params):
@@ -682,7 +754,7 @@ class BPFast():
         p_out = 0.0
         for v_p in self.fit_p_list:
             i_p = self.init_p_id[v_p]
-            p_out += self.model_prior[v_p](params[i_p])
+            p_out += self.p_prior[v_p](params[i_p])
         return p_out    
 
     def ln_posterior(self, params):
@@ -693,18 +765,29 @@ class BPFast():
         return prior + like, like # save both...
 
 # *** PRIORS ***
-class PriorNorm():    
+class PriorBase():
+    def get(self, attribute):
+        if hasattr(self, attribute):
+            return getattr(self, attribute)
+        else:
+            return None
+    def sampler(self, n_samples):
+        return np.random.normal(0, 1, n_samples)
+    def prior(self, param):
+        return param*0.0
+
+class PriorNorm(PriorBase):    
     def __init__(self, loc, scale):
         self.loc = loc # mean
         self.scale = scale # standard deviation
     def sampler(self, n_samples):
         # Sample from the normal distribution
         return np.random.normal(self.loc, self.scale, n_samples)
-    def prior(self, p):
+    def prior(self, param):
         # Return the log probability of the parameter given the normal distribution
-        return stats.norm.logpdf(p, self.loc, self.scale)
-
-class PriorUniform():
+        return stats.norm.logpdf(param, self.loc, self.scale)
+        
+class PriorUniform(PriorBase):
     def __init__(self, vmin, vmax):
         self.vmin = vmin
         self.vmax = vmax
@@ -713,18 +796,23 @@ class PriorUniform():
     def prior(self, param):
         return 0 if self.vmin <= param <= self.vmax else -np.inf
 
-class PriorFixed():
+class PriorFixed(PriorBase):
     def __init__(self, fixed_val):
         self.fixed_val = fixed_val
         self.vmin = fixed_val
         self.vmax = fixed_val
-    def prior(self, param):
-        # I know it seems silly, but it ensures the datatypes are the same
-        return param*0.0
+    def sampler(self, n_samples):
+        return np.ones(n_samples) * self.fixed_val
 
 class PriorNone():
     def __init__(self):
-        self.bounds = 'None'        
-    def prior(self,param):
-        # I know it seems silly, but it ensures the datatypes are the same
-        return param*0.0 
+        self.p_bounds = 'None'        
+    
+from scipy.special import erf
+class LatentTrans():
+    def __init__(self, vmin, vmax):
+        self.vmin = vmin
+        self.vmax = vmax
+    def transform(self, param):
+        return (self.vmax - self.vmin) * 0.5 * (1 + erf(param / np.sqrt(2)))
+        

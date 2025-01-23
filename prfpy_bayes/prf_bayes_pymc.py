@@ -11,6 +11,9 @@ from .utils import *
 from dag_prf_utils.prfpy_functions import *
 from dag_prf_utils.prfpy_ts_plotter import *
 
+print('THIS IS HIGHLY EXPERIMENTAL - EVEN MORE THAN THE REST!!!!')
+
+
 
 prfpy_global_model = PrfpyModelGlobal()
 class BayesPRFPyMC(TSPlotter):
